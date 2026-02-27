@@ -68,6 +68,7 @@ export class Commander {
     scoringBrain.homeSystem = deps.homeSystem ?? "";
     scoringBrain.defaultStorageMode = deps.defaultStorageMode ?? "sell";
     scoringBrain.crafting = deps.crafting;
+    scoringBrain.galaxy = deps.galaxy;
     scoringBrain.minBotCredits = deps.minBotCredits ?? 0;
     this.brain = brain ?? scoringBrain;
     this.economy = new EconomyEngine();
@@ -294,12 +295,20 @@ export class Commander {
       const system = galaxy.getSystem(bot.systemId);
       if (!system) continue;
 
+      // Check for resource POIs with remaining resources
+      // A POI with no resources array means we haven't scanned it yet (optimistic: assume available)
+      // A POI with resources all at remaining=0 means it's depleted
+      const hasResourcesLeft = (p: { resources: Array<{ remaining: number }> }) =>
+        p.resources.length === 0 || p.resources.some((r) => r.remaining > 0);
+
       const hasBelts = system.pois.some((p) =>
-        p.type === "asteroid_belt" || p.type === "asteroid"
+        (p.type === "asteroid_belt" || p.type === "asteroid") && hasResourcesLeft(p)
       );
-      const hasIceFields = system.pois.some((p) => p.type === "ice_field");
+      const hasIceFields = system.pois.some((p) =>
+        p.type === "ice_field" && hasResourcesLeft(p)
+      );
       const hasGasClouds = system.pois.some((p) =>
-        p.type === "gas_cloud" || p.type === "nebula"
+        (p.type === "gas_cloud" || p.type === "nebula") && hasResourcesLeft(p)
       );
       const stations = system.pois.filter((p) => p.hasBase && p.baseId);
       const hasStation = stations.length > 0;

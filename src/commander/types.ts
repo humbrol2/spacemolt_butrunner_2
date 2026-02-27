@@ -154,6 +154,7 @@ export interface StrategyWeights {
   mission_runner: number;
   return_home: number;
   scout: number;
+  quartermaster: number;
 }
 
 // ── Reassignment Tracking ──

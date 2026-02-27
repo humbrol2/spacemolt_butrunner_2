@@ -18,6 +18,7 @@ const DEFAULT_WEIGHTS: StrategyWeights = {
   mission_runner: 1.0,
   return_home: 0.1,
   scout: 0.1,
+  quartermaster: 0.8,
 };
 
 /** Goal-specific weight overrides */
@@ -76,6 +77,7 @@ const STRATEGY_PROFILES: Record<GoalType, Partial<StrategyWeights>> = {
     miner: 1.0,
     trader: 1.0,
     crafter: 1.0,
+    quartermaster: 1.5,
   },
   custom: {},
 };

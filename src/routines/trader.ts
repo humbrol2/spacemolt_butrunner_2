@@ -59,6 +59,40 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
     return;
   }
 
+  // ── Check faction storage for free sellable goods before buying ──
+  // Faction items cost nothing to acquire — any confirmed sell price is pure profit.
+  // viewFactionStorage requires docking, so this only fires when the bot is currently docked.
+  {
+    const factionStation = ctx.fleetConfig.factionStorageStation || ctx.fleetConfig.homeBase;
+    if (factionStation) {
+      try {
+        const storage = await ctx.api.viewFactionStorage();
+        const sellableItems = (storage ?? [])
+          .filter((s: { itemId: string; quantity: number }) => s.quantity > 0 && !s.itemId.startsWith("ore_"));
+
+        if (sellableItems.length > 0) {
+          // Check if any faction item has confirmed sell demand at a cached station
+          const cachedStationIds = ctx.cache.getAllMarketFreshness().map((f) => f.stationId);
+          for (const si of sellableItems) {
+            for (const stationId of cachedStationIds) {
+              if (stationId === factionStation) continue;
+              const prices = ctx.cache.getMarketPrices(stationId);
+              const sellPrice = prices?.find((p) => p.itemId === si.itemId)?.sellPrice ?? 0;
+              if (sellPrice > 0) {
+                const itemName = ctx.crafting.getItemName(si.itemId);
+                yield `faction has ${si.quantity} ${itemName} sellable @${sellPrice}cr — selling free goods first`;
+                yield* factionSellLoop(ctx, maxRoundTrips);
+                return;
+              }
+            }
+          }
+        }
+      } catch {
+        // viewFactionStorage may fail if not docked or not in a faction — continue normally
+      }
+    }
+  }
+
   // ── Auto-discover trade route ──
   if (!buyStation || !sellStation || !item) {
     yield "discovering trade route...";

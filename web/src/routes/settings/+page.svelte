@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { send, commanderLog, goals as goalsStore } from "$stores/websocket";
+	import { send, commanderLog, goals as goalsStore, fleetSettings as fleetSettingsStore } from "$stores/websocket";
 
 	let activeTab = $state("goals");
 
@@ -82,6 +82,13 @@
 		minCraftingMarginPct: 30,
 		batchSellSize: 100,
 		orderStaleTimeout: 120,
+	});
+
+	// Sync fleet settings from backend
+	$effect(() => {
+		const fs = $fleetSettingsStore;
+		fleetSettings.factionTaxPercent = fs.factionTaxPercent;
+		fleetSettings.minBotCredits = fs.minBotCredits;
 	});
 
 	let saveSuccess = $state(false);

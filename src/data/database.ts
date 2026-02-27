@@ -7,7 +7,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "fs";
 
 const DB_PATH = "data/commander.db";
-const CURRENT_SCHEMA_VERSION = 5;
+const CURRENT_SCHEMA_VERSION = 6;
 
 export function createDatabase(): Database {
   mkdirSync("data", { recursive: true });
@@ -41,6 +41,7 @@ function applyMigrations(db: Database, fromVersion: number): void {
     if (fromVersion < 3) migrateV3(db);
     if (fromVersion < 4) migrateV4(db);
     if (fromVersion < 5) migrateV5(db);
+    if (fromVersion < 6) migrateV6(db);
 
     // Update schema version
     db.run("DELETE FROM schema_version");
@@ -261,6 +262,17 @@ function migrateV5(db: Database): void {
   `);
   db.run("CREATE INDEX IF NOT EXISTS idx_trade_ts ON trade_log(timestamp)");
   db.run("CREATE INDEX IF NOT EXISTS idx_trade_bot ON trade_log(bot_id)");
+}
+
+function migrateV6(db: Database): void {
+  // ── Fleet settings (persisted across restarts) ──
+  db.run(`
+    CREATE TABLE IF NOT EXISTS fleet_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
 }
 
 // ── Helper for the cache ──

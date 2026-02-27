@@ -45,6 +45,7 @@ export const marketStations = writable<MarketStationData[]>([]);
 export const goals = writable<Goal[]>([]);
 export const factionState = writable<FactionState | null>(null);
 export const botStorage = writable<Map<string, BotStorageData>>(new Map());
+export const fleetSettings = writable<{ factionTaxPercent: number; minBotCredits: number }>({ factionTaxPercent: 0, minBotCredits: 0 });
 
 // Derived
 export const activeBots = derived(bots, ($bots) => $bots.filter((b) => b.status === "running"));
@@ -131,6 +132,10 @@ function handleMessage(event: MessageEvent) {
 
       case "faction_update":
         factionState.set(msg.faction);
+        break;
+
+      case "fleet_settings_update":
+        fleetSettings.set(msg.settings);
         break;
 
       case "bot_storage":

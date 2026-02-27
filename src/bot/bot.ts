@@ -53,8 +53,7 @@ export class Bot {
   private _ship: ShipState | null = null;
   private _session: SessionInfo | null = null;
   private _routineStartedAt: number = 0;
-  private _lastRapidRoutine: RoutineName | null = null;
-  private _lastRapidAt: number = 0;
+  private _rapidRoutines: Map<RoutineName, number> = new Map();
 
   /** Full skill data (fetched via getSkills after login) */
   private _skills: Record<string, { level: number; xp: number; xpNext: number }> = {};
@@ -116,11 +115,8 @@ export class Bot {
   get uptime(): number {
     return this._loginTime ? Date.now() - this._loginTime : 0;
   }
-  get lastRapidRoutine(): RoutineName | null {
-    return this._lastRapidRoutine;
-  }
-  get lastRapidAt(): number {
-    return this._lastRapidAt;
+  get rapidRoutines(): Map<RoutineName, number> {
+    return this._rapidRoutines;
   }
   /** Skill levels as flat record (e.g. { mining: 3, trading: 1 }) */
   get skillLevels(): Record<string, number> {
@@ -433,9 +429,17 @@ export class Bot {
           await ctx.api.factionDepositItems(item.itemId, item.quantity);
           console.log(`[${this.id}] deposited ${item.quantity} ${item.itemId} to faction storage`);
           await ctx.refreshState();
-        } catch {
-          console.log(`[${this.id}] could not dispose ${item.quantity} ${item.itemId} (sell+deposit failed)`);
-        }
+          continue;
+        } catch { /* faction deposit failed too */ }
+      }
+
+      // Last resort: deposit to station storage (never jettison)
+      try {
+        await ctx.api.depositItems(item.itemId, item.quantity);
+        console.log(`[${this.id}] stashed ${item.quantity} ${item.itemId} in station storage`);
+        await ctx.refreshState();
+      } catch {
+        // Item stays in cargo — nothing we can do without leaving station
       }
     }
   }
@@ -443,8 +447,13 @@ export class Bot {
   private async runRoutineLoop(): Promise<void> {
     if (!this._generator) return;
 
+    // Capture identity of THIS loop invocation — if stopRoutine() resets
+    // and a new assignRoutine() fires, the old loop must not clobber new state
+    const myStartedAt = this._routineStartedAt;
+    const myRoutine = this._routine;
+
     try {
-      while (!this._shouldStop) {
+      while (!this._shouldStop && this._generator) {
         const result = await this._generator.next();
 
         if (result.done) {
@@ -455,22 +464,27 @@ export class Bot {
 
         // Update state label from yielded string
         this._routineState = result.value;
-        console.log(`[Bot:${this.username}] ${this._routine}: ${result.value}`);
-        this.onStateChange?.(this.id, this._routine ?? "", result.value);
+        console.log(`[Bot:${this.username}] ${myRoutine}: ${result.value}`);
+        this.onStateChange?.(this.id, myRoutine ?? "", result.value);
       }
     } catch (err) {
-      this._error = err instanceof Error ? err.message : String(err);
-      this._status = "error";
-      console.error(`[Bot:${this.username}] Routine error: ${this._error}`);
+      // Only set error state if we're still the active routine (not superseded)
+      if (this._routineStartedAt === myStartedAt) {
+        this._error = err instanceof Error ? err.message : String(err);
+        this._status = "error";
+        console.error(`[Bot:${this.username}] Routine error: ${this._error}`);
+      }
       return;
     }
 
+    // Only run cleanup if we're still the active routine (not superseded by a new assignment)
+    if (this._routineStartedAt !== myStartedAt) return;
+
     // Clean exit - track rapid completions (< 60s = routine couldn't find work)
-    const routineDuration = Date.now() - this._routineStartedAt;
-    if (routineDuration < 60_000 && this._routine && !this._shouldStop) {
-      this._lastRapidRoutine = this._routine;
-      this._lastRapidAt = Date.now();
-      console.log(`[Bot:${this.username}] ${this._routine} completed rapidly (${(routineDuration / 1000).toFixed(0)}s) - will avoid re-assignment`);
+    const routineDuration = Date.now() - myStartedAt;
+    if (routineDuration < 60_000 && myRoutine && !this._shouldStop) {
+      this._rapidRoutines.set(myRoutine, Date.now());
+      console.log(`[Bot:${this.username}] ${myRoutine} completed rapidly (${(routineDuration / 1000).toFixed(0)}s) - will avoid re-assignment (${this._rapidRoutines.size} blocked)`);
     }
 
     this._generator = null;

@@ -3,7 +3,7 @@
  * Wires together all components and starts the system.
  */
 
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, existsSync, mkdirSync, createWriteStream } from "fs";
 import TOML from "toml";
 import { createDatabase, CacheHelper } from "./data/database";
 import { SessionStore } from "./data/session-store";
@@ -21,6 +21,38 @@ import type { ClientMessage, RoutineName, FleetStats, ServerMessage, EconomyStat
 import type { Database } from "bun:sqlite";
 
 const VERSION = "2.0.0";
+
+// ── File Logging ──
+// Tee all console output to logs/commander.log (timestamped, rotates daily)
+{
+  mkdirSync("logs", { recursive: true });
+  const date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const logStream = createWriteStream(`logs/commander-${date}.log`, { flags: "a" });
+
+  function timestamp(): string {
+    return new Date().toISOString();
+  }
+
+  const origLog = console.log;
+  const origWarn = console.warn;
+  const origError = console.error;
+
+  console.log = (...args: unknown[]) => {
+    const line = `[${timestamp()}] ${args.map(String).join(" ")}`;
+    logStream.write(line + "\n");
+    origLog.apply(console, args);
+  };
+  console.warn = (...args: unknown[]) => {
+    const line = `[${timestamp()}] WARN ${args.map(String).join(" ")}`;
+    logStream.write(line + "\n");
+    origWarn.apply(console, args);
+  };
+  console.error = (...args: unknown[]) => {
+    const line = `[${timestamp()}] ERROR ${args.map(String).join(" ")}`;
+    logStream.write(line + "\n");
+    origError.apply(console, args);
+  };
+}
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -82,6 +114,24 @@ function loadBotSettings(db: Database, username: string): {
     maxCargoFillPct: row.max_cargo_fill_pct,
     storageMode: row.storage_mode as "sell" | "deposit" | "faction_deposit",
     factionStorage: row.faction_storage === 1,
+  };
+}
+
+// ── Fleet Settings Persistence ──
+
+function saveFleetSettings(db: Database, settings: { factionTaxPercent: number; minBotCredits: number }): void {
+  const stmt = db.prepare("INSERT OR REPLACE INTO fleet_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))");
+  stmt.run("factionTaxPercent", String(settings.factionTaxPercent));
+  stmt.run("minBotCredits", String(settings.minBotCredits));
+}
+
+function loadFleetSettings(db: Database): { factionTaxPercent: number; minBotCredits: number } | null {
+  const rows = db.query("SELECT key, value FROM fleet_settings").all() as Array<{ key: string; value: string }>;
+  if (rows.length === 0) return null;
+  const map = new Map(rows.map((r) => [r.key, r.value]));
+  return {
+    factionTaxPercent: Number(map.get("factionTaxPercent") ?? 0),
+    minBotCredits: Number(map.get("minBotCredits") ?? 0),
   };
 }
 
@@ -206,6 +256,14 @@ async function main() {
     minBotCredits: config.fleet.min_bot_credits,
   };
 
+  // Override with persisted fleet settings (if any)
+  const savedFleetSettings = loadFleetSettings(db);
+  if (savedFleetSettings) {
+    botManager.fleetConfig.factionTaxPercent = savedFleetSettings.factionTaxPercent;
+    botManager.fleetConfig.minBotCredits = savedFleetSettings.minBotCredits;
+    console.log(`[Config] Loaded saved fleet settings: tax=${savedFleetSettings.factionTaxPercent}%, minCredits=${savedFleetSettings.minBotCredits}`);
+  }
+
   // Register all routines
   botManager.registerRoutines(buildRoutineRegistry());
   console.log("[Fleet] Routines registered: 10");
@@ -229,7 +287,7 @@ async function main() {
 
     // Scout completed: propagate discovered faction storage to entire fleet
     if (routine === "scout" && state.startsWith("faction storage confirmed")) {
-      const bot = botManager.getAllBots().find((b) => b.botId === botId);
+      const bot = botManager.getAllBots().find((b) => b.id === botId);
       if (bot?.fleetConfig.factionStorageStation) {
         const stationId = bot.fleetConfig.factionStorageStation;
         const systemId = bot.fleetConfig.homeSystem;
@@ -404,6 +462,9 @@ async function main() {
       const currentGoals = commander.getGoals();
       sendTo(ws, { type: "goals_update", goals: currentGoals });
 
+      // Send current fleet settings
+      sendTo(ws, { type: "fleet_settings_update", settings: { factionTaxPercent: botManager.fleetConfig.factionTaxPercent, minBotCredits: botManager.fleetConfig.minBotCredits } });
+
       // Send faction data (async, non-blocking)
       buildFactionState(botManager, commander, { defaultStorageMode: config.fleet.default_storage_mode }).then((faction) => {
         if (faction) sendTo(ws, { type: "faction_update", faction });
@@ -529,6 +590,14 @@ async function main() {
   botManager.startSnapshots();
   commander.start();
 
+  // Force an immediate evaluation so bots get assigned right away (don't wait 60s for the first interval tick)
+  if (botManager.botCount > 0) {
+    console.log("[Commander] Running initial evaluation...");
+    commander.forceEvaluation().catch((err) => {
+      console.error("[Commander] Initial evaluation failed:", err instanceof Error ? err.message : err);
+    });
+  }
+
   // Print startup summary
   const stats = trainingLogger.getStats();
   console.log(`[Training] ${stats.decisions} decisions, ${stats.episodes} episodes, ${stats.marketRecords} market records`);
@@ -650,7 +719,14 @@ function handleClientMessage(
         if (s.minBotCredits !== undefined) {
           botManager.fleetConfig.minBotCredits = Math.max(0, Number(s.minBotCredits));
         }
-        console.log("[Settings] Updated:", Object.keys(msg.settings).join(", "));
+        // Persist to database
+        saveFleetSettings(db, {
+          factionTaxPercent: botManager.fleetConfig.factionTaxPercent,
+          minBotCredits: botManager.fleetConfig.minBotCredits,
+        });
+        console.log("[Settings] Updated & persisted:", Object.keys(msg.settings).join(", "));
+        // Broadcast current settings to all clients
+        broadcast({ type: "fleet_settings_update", settings: { factionTaxPercent: botManager.fleetConfig.factionTaxPercent, minBotCredits: botManager.fleetConfig.minBotCredits } });
         broadcast({ type: "notification", level: "info", title: "Settings Saved", message: "Fleet settings updated" });
         break;
       }
@@ -914,8 +990,8 @@ async function buildFactionState(
         console.warn("[Faction] viewFactionStorageFull() failed (bot may not be docked):", err instanceof Error ? err.message : err);
         return { credits: 0, items: [], itemNames: new Map<string, string>() };
       }),
-      // Faction facilities are a separate API endpoint (not in faction_info)
-      api.factionListFacilities().catch((err) => {
+      // Faction facilities requires docking — use docked bot if available
+      (storageApi ?? api).factionListFacilities().catch((err) => {
         console.warn("[Faction] factionListFacilities() failed:", err instanceof Error ? err.message : err);
         return [] as Array<Record<string, unknown>>;
       }),
@@ -1112,7 +1188,10 @@ async function ensureFactionMembership(botManager: BotManager): Promise<void> {
 /**
  * Periodic check: if a leader bot is docked at the faction home station,
  * promote any faction members that aren't yet officers.
+ * Tracks already-promoted bots to avoid re-attempting every cycle.
  */
+const _promotedBots = new Set<string>();
+
 async function promoteFactionMembers(botManager: BotManager): Promise<void> {
   const factionHome = botManager.fleetConfig.factionStorageStation || botManager.fleetConfig.homeBase;
   if (!factionHome) return;
@@ -1132,12 +1211,13 @@ async function promoteFactionMembers(botManager: BotManager): Promise<void> {
 
   const factionId = leader.player!.factionId!;
 
-  // Find faction members that need promotion
+  // Find faction members that need promotion (skip already-promoted)
   const needPromotion = allBots.filter(
     (b) => b.player!.factionId === factionId
       && b.player!.factionRank !== "officer"
       && b.player!.factionRank !== "leader"
       && b !== leader
+      && !_promotedBots.has(b.id)
   );
   if (needPromotion.length === 0) return;
 
@@ -1145,9 +1225,12 @@ async function promoteFactionMembers(botManager: BotManager): Promise<void> {
   for (const bot of needPromotion) {
     try {
       await leader.api!.factionPromote(bot.username, "officer");
+      _promotedBots.add(bot.id);
       console.log(`[Faction] Promoted ${bot.username} to officer`);
       await sleep(11_000);
     } catch (err) {
+      // Mark as promoted anyway to avoid spamming failed attempts
+      _promotedBots.add(bot.id);
       console.warn(`[Faction] Failed to promote ${bot.username}: ${err instanceof Error ? err.message : err}`);
     }
   }
@@ -1271,9 +1354,13 @@ async function discoverFactionStorage(
       console.warn(`[Faction] faction_info failed: ${err instanceof Error ? err.message : err}`);
     }
 
-    // 2b. Query faction facilities API (separate endpoint from faction_info)
+    // 2b. Query faction facilities API (requires docking — find a docked bot)
+    const dockedBot = botManager.getAllBots().find(
+      (b) => b.api && b.player?.dockedAtBase && b.player?.factionId && (b.status === "ready" || b.status === "running")
+    );
+    const facilitiesApi = dockedBot?.api ?? api;
     try {
-      const facilities = await api.factionListFacilities();
+      const facilities = await facilitiesApi.factionListFacilities();
       console.log(`[Faction] factionListFacilities: ${facilities.length} facilities`);
       for (const f of facilities.slice(0, 5)) {
         console.log(`[Faction]   facility: ${JSON.stringify(f)}`);

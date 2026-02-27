@@ -32,6 +32,68 @@ export async function* miner(ctx: BotContext): AsyncGenerator<string, void, void
   let sellStation = getParam(ctx, "sellStation", "");
   const targetOre = getParam(ctx, "targetOre", "");
   const depositToStorage = getParam(ctx, "depositToStorage", false);
+  const equipModules = getParam<string[]>(ctx, "equipModules", []);
+  const unequipModules = getParam<string[]>(ctx, "unequipModules", []);
+
+  // ── Equip/unequip modules if commanded by scoring brain ──
+  if ((equipModules.length > 0 || unequipModules.length > 0) && ctx.player.dockedAtBase) {
+    // Unequip modules that aren't needed for this assignment
+    for (const modId of unequipModules) {
+      if (ctx.shouldStop) return;
+      try {
+        await ctx.api.uninstallMod(modId);
+        await ctx.refreshState();
+        yield `unequipped ${modId}`;
+      } catch (err) {
+        yield `unequip ${modId} failed: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
+
+    // Equip modules needed for this assignment (withdraw from faction storage first)
+    for (const modPattern of equipModules) {
+      if (ctx.shouldStop) return;
+      // Check if already equipped
+      if (ctx.ship.modules.some((m) => m.moduleId.includes(modPattern))) continue;
+      // Check cargo first
+      const inCargo = ctx.ship.cargo.find((c) => c.itemId.includes(modPattern));
+      if (inCargo) {
+        try {
+          await ctx.api.installMod(inCargo.itemId);
+          await ctx.refreshState();
+          yield `equipped ${inCargo.itemId} from cargo`;
+          continue;
+        } catch (err) {
+          yield `equip ${inCargo.itemId} failed: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      }
+      // Withdraw from faction storage
+      try {
+        // Find exact item ID in faction storage matching pattern
+        const storage = await ctx.api.viewFactionStorage();
+        const mod = (storage ?? []).find((s) => s.itemId.includes(modPattern) && s.quantity > 0);
+        if (mod) {
+          await ctx.api.factionWithdrawItems(mod.itemId, 1);
+          await ctx.refreshState();
+          yield `withdrew ${mod.itemId} from faction storage`;
+          // Now install it
+          try {
+            await ctx.api.installMod(mod.itemId);
+            await ctx.refreshState();
+            yield `equipped ${mod.itemId}`;
+          } catch (err) {
+            yield `equip ${mod.itemId} failed: ${err instanceof Error ? err.message : String(err)}`;
+            // Deposit it back
+            try {
+              await ctx.api.factionDepositItems(mod.itemId, 1);
+              await ctx.refreshState();
+            } catch { /* best effort */ }
+          }
+        }
+      } catch (err) {
+        yield `module withdraw failed: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
+  }
 
   // Auto-discover targets if not provided
   if (!targetBelt || !sellStation) {
@@ -98,6 +160,9 @@ export async function* miner(ctx: BotContext): AsyncGenerator<string, void, void
     if (ctx.shouldStop) return;
 
     // ── Mine until full ──
+    const cargoBeforeMining = ctx.ship.cargo.reduce((sum, c) => sum + c.quantity, 0);
+    let beltDepleted = false;
+
     while (!ctx.shouldStop && ctx.cargo.hasSpace(ctx.ship, 1)) {
       yield `mining${targetOre ? ` ${targetOre}` : ""}`;
       try {
@@ -106,12 +171,14 @@ export async function* miner(ctx: BotContext): AsyncGenerator<string, void, void
 
         if (result.quantity === 0 || result.remaining === 0) {
           yield "belt depleted";
+          beltDepleted = true;
           break;
         }
 
         yield `mined ${result.quantity} ${result.resourceId}`;
       } catch (err) {
         yield `mining error: ${err instanceof Error ? err.message : String(err)}`;
+        beltDepleted = true;
         break;
       }
 
@@ -123,6 +190,21 @@ export async function* miner(ctx: BotContext): AsyncGenerator<string, void, void
     }
 
     if (ctx.shouldStop) return;
+
+    // If belt depleted, update POI resource data so Commander/scoring knows
+    if (beltDepleted && targetBelt) {
+      ctx.galaxy.updatePoiResources(targetBelt, []);
+      yield "marked belt as depleted in galaxy data";
+    }
+
+    // If belt depleted and we mined nothing, end cycle so Commander can reassign
+    // (avoids repeatedly traveling to the same depleted belt)
+    const cargoAfterMining = ctx.ship.cargo.reduce((sum, c) => sum + c.quantity, 0);
+    if (beltDepleted && cargoAfterMining <= cargoBeforeMining) {
+      yield "belt empty, requesting reassignment";
+      yield "cycle_complete";
+      return;
+    }
 
     // ── Return to station ──
     // Determine disposal mode first (affects station choice)

@@ -16,7 +16,8 @@ export type RoutineName =
   | "salvager"
   | "mission_runner"
   | "return_home"
-  | "scout";
+  | "scout"
+  | "quartermaster";
 
 export const ROUTINE_COLORS: Record<RoutineName, string> = {
   miner: "#ff6b35",
@@ -29,6 +30,7 @@ export const ROUTINE_COLORS: Record<RoutineName, string> = {
   mission_runner: "#ffd700",
   return_home: "#8899aa",
   scout: "#66ccff",
+  quartermaster: "#c9a84c",
 };
 
 export type BotStatus = "idle" | "logging_in" | "ready" | "running" | "stopping" | "error";
@@ -303,6 +305,7 @@ export type ServerMessage =
   | { type: "goals_update"; goals: Goal[] }
   | { type: "faction_update"; faction: FactionState }
   | { type: "connected"; version: string }
+  | { type: "fleet_settings_update"; settings: { factionTaxPercent: number; minBotCredits: number } }
   | { type: "bot_storage"; botId: string; storage: BotStorageData };
 
 // ── Dashboard → Server Messages ──

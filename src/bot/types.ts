@@ -80,10 +80,8 @@ export interface FleetBotInfo {
   shipClass: string | null;
   /** Bot skill levels (e.g. { mining: 3, trading: 1 }) */
   skills: Record<string, number>;
-  /** Last routine that completed too quickly (< 60s), indicating it couldn't find work */
-  lastRapidRoutine: RoutineName | null;
-  /** When the rapid completion was recorded */
-  lastRapidAt: number;
+  /** Routines that completed too quickly (< 60s), mapped to timestamp of failure */
+  rapidRoutines: Map<RoutineName, number>;
 }
 
 export interface FleetStatus {

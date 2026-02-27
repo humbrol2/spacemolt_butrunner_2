@@ -483,6 +483,10 @@ export class ApiClient {
     return normalizeTradeResult(data);
   }
 
+  async jettison(itemId: string, quantity: number): Promise<Record<string, unknown>> {
+    return this.mutation("jettison", { item_id: itemId, quantity });
+  }
+
   async buy(itemId: string, quantity: number): Promise<TradeResult> {
     const data = await this.mutation<Record<string, unknown>>("buy", { item_id: itemId, quantity });
     return normalizeTradeResult(data);

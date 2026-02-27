@@ -23,7 +23,7 @@ import { getStrategyWeights } from "./strategies";
 
 const ALL_ROUTINES: RoutineName[] = [
   "miner", "harvester", "trader", "explorer", "crafter",
-  "hunter", "salvager", "return_home", "scout",
+  "hunter", "salvager", "return_home", "scout", "quartermaster",
   // "mission_runner", // Disabled until mission system is tested
 ];
 
@@ -35,6 +35,7 @@ const FIELD_ROUTINES: Set<RoutineName> = new Set(["trader", "hunter", "explorer"
 const ROUTINE_MAX_COUNT: Partial<Record<RoutineName, number>> = {
   scout: 1,
   explorer: 1, // Default; overridden by getMaxCount() for larger fleets
+  quartermaster: 1, // Only one faction home manager
 };
 
 /** Dynamic max count: scales explorer cap with fleet size */
@@ -78,6 +79,7 @@ const DEFAULT_CONFIG: ScoringConfig = {
     mission_runner: 45, // Good auto-discovery, reliable income
     return_home: 5,     // Utility routine — only for idle bots away from home
     scout: 10,          // One-shot data gathering — scored high only when data is needed
+    quartermaster: 35,  // Faction home manager — sells goods, buys modules
   },
   supplyMultiplier: 15,
   skillBonus: 10,
@@ -358,9 +360,11 @@ export class ScoringBrain implements CommanderBrain {
     const diversityPenalty = Math.min(rawDiversityPenalty, baseScore * 0.8); // Never exceed 80% of base
 
     // 7. Rapid completion penalty: routine recently failed to find work (completed in < 60s)
-    const RAPID_EXPIRY_MS = 180_000; // 3 minutes
-    const rapidPenalty = (bot.lastRapidRoutine === routine && (Date.now() - bot.lastRapidAt) < RAPID_EXPIRY_MS)
-      ? 40 // Moderate penalty - probably can't do this routine right now
+    //    Tracks ALL recently-failed routines (not just the last one) to prevent alternating failures
+    const RAPID_EXPIRY_MS = 300_000; // 5 minutes
+    const rapidAt = bot.rapidRoutines.get(routine);
+    const rapidPenalty = (rapidAt && (Date.now() - rapidAt) < RAPID_EXPIRY_MS)
+      ? 200 // Strong penalty — this routine definitively can't work right now
       : 0;
 
     // 8. Information scarcity bonus: uses world context for data-aware scoring
@@ -765,6 +769,21 @@ export class ScoringBrain implements CommanderBrain {
         // No home configured at all — block
         return 200;
       }
+      case "quartermaster": {
+        if (!bot) return 200;
+        // Only assign when faction home is configured
+        if (!this.homeBase) return 200;
+        // Hard cap: only 1 quartermaster
+        const qmCount = fleet?.bots.filter((b) => b.routine === "quartermaster").length ?? 0;
+        if (qmCount >= 1 && bot.routine !== "quartermaster") return 200;
+        // Need at least 3 bots to justify a dedicated quartermaster
+        if (fleet && fleet.bots.length < 3) return 200;
+        // Bonus when faction storage has sellable goods
+        const hasSellableGoods = [...economy.factionStorage.entries()]
+          .some(([id, qty]) => qty > 0 && !id.startsWith("ore_"));
+        // Bonus: +30 if there are goods to sell, +10 base for fleet management
+        return hasSellableGoods ? -30 : -10;
+      }
       default:
         return 0;
     }
@@ -816,11 +835,7 @@ export class ScoringBrain implements CommanderBrain {
     // Base params - routines use these to guide behavior
     switch (routine) {
       case "miner":
-        return {
-          targetBelt: "",
-          sellStation: homeBase, // Route miners to home base for centralized deposits
-          depositToStorage: true, // Always deposit ore to faction — crafters refine & sell
-        };
+        return this.buildMinerParams(bot, economy, existingAssignments, world);
       case "harvester":
         return {
           targets: [],
@@ -845,6 +860,8 @@ export class ScoringBrain implements CommanderBrain {
         return { homeBase: this.homeBase, homeSystem: this.homeSystem };
       case "scout":
         return { targetSystem: this.homeSystem, scanMarket: true, checkFaction: true };
+      case "quartermaster":
+        return { homeBase: this.homeBase };
       default:
         return {};
     }
@@ -918,6 +935,8 @@ export class ScoringBrain implements CommanderBrain {
   minBotCredits = 0;
   /** Crafting service (set by Commander for recipe-aware crafter params) */
   crafting: import("../core/crafting").Crafting | null = null;
+  /** Galaxy service (set by Commander for belt-aware miner params) */
+  galaxy: import("../core/galaxy").Galaxy | null = null;
 
   /**
    * Build crafter params with intelligent recipe selection:
@@ -992,6 +1011,9 @@ export class ScoringBrain implements CommanderBrain {
       if (hasMaterials && rawMaterials.size > 0) {
         score += 30; // Big bonus if we can craft right now
         reason += " +materials_ready";
+      } else if (rawMaterials.size > 0) {
+        score -= 100; // Heavy penalty — this recipe will fail immediately
+        reason += " -no_materials";
       }
       score += materialScore;
 
@@ -1045,6 +1067,143 @@ export class ScoringBrain implements CommanderBrain {
       return {
         ...baseParams,
         recipeId: best.recipe.id,
+      };
+    }
+
+    return baseParams;
+  }
+
+  /**
+   * Build miner params with intelligent belt selection:
+   * 1. Check what ores are most needed (faction storage deficits)
+   * 2. Find belts with those resources (non-depleted)
+   * 3. Pick closest non-claimed belt for this miner
+   * 4. Specify equipment modules to install if available in faction storage
+   */
+  private buildMinerParams(
+    bot: FleetBotInfo,
+    economy: EconomySnapshot,
+    existingAssignments: Assignment[],
+    world?: WorldContext,
+  ): Record<string, unknown> {
+    const homeBase = this.homeBase;
+    const baseParams = {
+      targetBelt: "",
+      sellStation: homeBase,
+      depositToStorage: true,
+      equipModules: [] as string[],
+      unequipModules: [] as string[],
+    };
+
+    if (!this.galaxy) return baseParams;
+
+    // Determine what resource type is most needed
+    // Map: POI type → ore prefixes found there
+    const POI_ORE_MAP: Record<string, string[]> = {
+      asteroid_belt: ["ore_iron", "ore_copper", "ore_titanium", "ore_gold", "ore_nickel", "ore_sol"],
+      asteroid: ["ore_iron", "ore_copper", "ore_titanium", "ore_gold", "ore_nickel", "ore_sol"],
+      ice_field: ["ore_ice"],
+      gas_cloud: ["ore_crystal", "ore_gas"],
+      nebula: ["ore_crystal", "ore_gas"],
+    };
+
+    // Equipment needed per POI type
+    const POI_EQUIP: Record<string, string> = {
+      ice_field: "ice_harvester",
+      gas_cloud: "gas_harvester",
+      nebula: "gas_harvester",
+    };
+
+    // Rank resource types by need (lowest faction storage = most needed)
+    const oreStock: Array<{ poiType: string; stock: number }> = [];
+    for (const [poiType, orePatterns] of Object.entries(POI_ORE_MAP)) {
+      const stock = orePatterns.reduce((sum, prefix) => {
+        let total = 0;
+        for (const [itemId, qty] of economy.factionStorage) {
+          if (itemId.startsWith(prefix)) total += qty;
+        }
+        return sum + total;
+      }, 0);
+      oreStock.push({ poiType, stock });
+    }
+    // Deduplicate asteroid/asteroid_belt (same thing)
+    const uniqueStock = oreStock.filter((o, i, arr) =>
+      i === arr.findIndex((x) => {
+        const norm = (t: string) => t === "asteroid" ? "asteroid_belt" : t === "nebula" ? "gas_cloud" : t;
+        return norm(x.poiType) === norm(o.poiType);
+      })
+    );
+    uniqueStock.sort((a, b) => a.stock - b.stock); // Lowest stock first
+
+    // Collect belts already claimed by other miners this eval
+    const claimedBelts = new Set<string>();
+    for (const a of existingAssignments) {
+      if (a.routine === "miner" && a.params.targetBelt) {
+        claimedBelts.add(String(a.params.targetBelt));
+      }
+    }
+
+    // Find best belt: iterate through needed resource types, find unclaimed non-depleted POIs
+    const botSystem = bot.systemId ?? this.homeSystem;
+    const hasResourcesLeft = (poi: { resources: Array<{ remaining: number }> }) =>
+      poi.resources.length === 0 || poi.resources.some((r) => r.remaining > 0);
+
+    for (const { poiType } of uniqueStock) {
+      // Find all POIs of this type
+      const normalizedTypes = poiType === "asteroid_belt"
+        ? ["asteroid_belt", "asteroid"] : poiType === "gas_cloud"
+        ? ["gas_cloud", "nebula"] : [poiType];
+
+      const candidates: Array<{ systemId: string; poiId: string; distance: number }> = [];
+      for (const type of normalizedTypes) {
+        const pois = this.galaxy.findPoisByType(type as import("../types/game").PoiType);
+        for (const { systemId, poi } of pois) {
+          if (claimedBelts.has(poi.id)) continue;
+          if (!hasResourcesLeft(poi)) continue;
+          // Calculate distance from bot's current system
+          const distance = botSystem ? (systemId === botSystem ? 0 : 1) : 99;
+          candidates.push({ systemId, poiId: poi.id, distance });
+        }
+      }
+
+      if (candidates.length === 0) continue;
+
+      // Pick closest
+      candidates.sort((a, b) => a.distance - b.distance);
+      const best = candidates[0];
+
+      // Check if bot needs special equipment for this POI type
+      const neededModule = POI_EQUIP[poiType];
+      const hasModule = neededModule
+        ? bot.moduleIds.some((id) => id.includes(neededModule))
+        : true;
+      const moduleInStorage = neededModule
+        ? (economy.factionStorage.get(neededModule) ?? 0) > 0
+        : false;
+
+      // Skip ice/gas if bot lacks module AND none in faction storage
+      if (neededModule && !hasModule && !moduleInStorage) continue;
+
+      // Build equip/unequip lists
+      const equipModules: string[] = [];
+      const unequipModules: string[] = [];
+      if (neededModule && !hasModule && moduleInStorage) {
+        equipModules.push(neededModule);
+      }
+      // If going to asteroid belt but has ice/gas harvester, suggest unequip to free slot
+      if (!neededModule) {
+        for (const modId of bot.moduleIds) {
+          if (modId.includes("ice_harvester") || modId.includes("gas_harvester")) {
+            unequipModules.push(modId);
+          }
+        }
+      }
+
+      return {
+        ...baseParams,
+        targetBelt: best.poiId,
+        equipModules,
+        unequipModules,
       };
     }
 

@@ -105,8 +105,7 @@ export class BotManager {
         moduleIds: ship?.modules.map((m) => m.moduleId) ?? [],
         shipClass: ship?.classId ?? null,
         skills: bot.skillLevels,
-        lastRapidRoutine: bot.lastRapidRoutine,
-        lastRapidAt: bot.lastRapidAt,
+        rapidRoutines: bot.rapidRoutines,
       });
 
       totalCredits += player?.credits ?? 0;
