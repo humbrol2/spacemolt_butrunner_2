@@ -1109,6 +1109,50 @@ async function ensureFactionMembership(botManager: BotManager): Promise<void> {
   console.log("[Faction] Membership check complete");
 }
 
+/**
+ * Periodic check: if a leader bot is docked at the faction home station,
+ * promote any faction members that aren't yet officers.
+ */
+async function promoteFactionMembers(botManager: BotManager): Promise<void> {
+  const factionHome = botManager.fleetConfig.factionStorageStation || botManager.fleetConfig.homeBase;
+  if (!factionHome) return;
+
+  const allBots = botManager.getAllBots().filter(
+    (b) => b.player && b.api && (b.status === "ready" || b.status === "running")
+  );
+  if (allBots.length < 2) return;
+
+  // Find a leader bot docked at faction home
+  const leader = allBots.find(
+    (b) => b.player!.factionId
+      && b.player!.factionRank === "leader"
+      && b.player!.dockedAtBase === factionHome
+  );
+  if (!leader) return;
+
+  const factionId = leader.player!.factionId!;
+
+  // Find faction members that need promotion
+  const needPromotion = allBots.filter(
+    (b) => b.player!.factionId === factionId
+      && b.player!.factionRank !== "officer"
+      && b.player!.factionRank !== "leader"
+      && b !== leader
+  );
+  if (needPromotion.length === 0) return;
+
+  console.log(`[Faction] Promoting ${needPromotion.length} member(s) to officer (leader docked at home)`);
+  for (const bot of needPromotion) {
+    try {
+      await leader.api!.factionPromote(bot.username, "officer");
+      console.log(`[Faction] Promoted ${bot.username} to officer`);
+      await sleep(11_000);
+    } catch (err) {
+      console.warn(`[Faction] Failed to promote ${bot.username}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+}
+
 /** Navigate a bot to a target base — undock if needed, travel, dock. Used for faction enrollment. */
 async function navigateBotToBase(bot: import("./bot/bot").Bot, baseId: string): Promise<void> {
   const api = bot.api!;
@@ -1552,6 +1596,12 @@ function startBroadcastLoop(
           buildFactionState(botManager, commander, { defaultStorageMode }).then((faction) => {
             if (faction) broadcast({ type: "faction_update", faction });
           }).catch(() => {});
+        }
+
+        // Faction promotion check (every 60s = tick 20)
+        // If an officer/leader is docked at faction home, promote non-officer members
+        if (tick % 20 === 0) {
+          promoteFactionMembers(botManager).catch(() => {});
         }
       }
     } catch (err) {

@@ -239,16 +239,6 @@
 								</button>
 							</th>
 							<th class="pb-2 px-3 text-right">
-								<button class="hover:text-star-white transition-colors" onclick={() => toggleSort("buy")}>
-									Buy{sortIcon("buy")}
-								</button>
-							</th>
-							<th class="pb-2 px-3 text-right">
-								<button class="hover:text-star-white transition-colors" onclick={() => toggleSort("buyVol")}>
-									Buy Qty{sortIcon("buyVol")}
-								</button>
-							</th>
-							<th class="pb-2 px-3 text-right">
 								<button class="hover:text-star-white transition-colors" onclick={() => toggleSort("sell")}>
 									Sell{sortIcon("sell")}
 								</button>
@@ -256,6 +246,16 @@
 							<th class="pb-2 px-3 text-right">
 								<button class="hover:text-star-white transition-colors" onclick={() => toggleSort("sellVol")}>
 									Sell Qty{sortIcon("sellVol")}
+								</button>
+							</th>
+							<th class="pb-2 px-3 text-right">
+								<button class="hover:text-star-white transition-colors" onclick={() => toggleSort("buy")}>
+									Buy{sortIcon("buy")}
+								</button>
+							</th>
+							<th class="pb-2 px-3 text-right">
+								<button class="hover:text-star-white transition-colors" onclick={() => toggleSort("buyVol")}>
+									Buy Qty{sortIcon("buyVol")}
 								</button>
 							</th>
 							<th class="pb-2 px-3 text-right">
@@ -276,24 +276,24 @@
 									<span class="text-star-white font-medium">{item.itemName}</span>
 								</td>
 								<td class="py-2 px-3 text-right mono">
-									{#if item.bestBuy > 0}
-										<span class="text-plasma-cyan">{item.bestBuy.toLocaleString()}</span>
-									{:else}
-										<span class="text-hull-grey/40">-</span>
-									{/if}
-								</td>
-								<td class="py-2 px-3 text-right mono text-chrome-silver">
-									{item.totalBuyVolume > 0 ? item.totalBuyVolume.toLocaleString() : "-"}
-								</td>
-								<td class="py-2 px-3 text-right mono">
 									{#if item.bestSell > 0}
-										<span class="text-shell-orange">{item.bestSell.toLocaleString()}</span>
+										<span class="text-bio-green">{item.bestSell.toLocaleString()}</span>
 									{:else}
 										<span class="text-hull-grey/40">-</span>
 									{/if}
 								</td>
 								<td class="py-2 px-3 text-right mono text-chrome-silver">
 									{item.totalSellVolume > 0 ? item.totalSellVolume.toLocaleString() : "-"}
+								</td>
+								<td class="py-2 px-3 text-right mono">
+									{#if item.bestBuy > 0}
+										<span class="text-claw-red">{item.bestBuy.toLocaleString()}</span>
+									{:else}
+										<span class="text-hull-grey/40">-</span>
+									{/if}
+								</td>
+								<td class="py-2 px-3 text-right mono text-chrome-silver">
+									{item.totalBuyVolume > 0 ? item.totalBuyVolume.toLocaleString() : "-"}
 								</td>
 								<td class="py-2 px-3 text-right mono font-medium {item.spread > 0 ? 'text-bio-green' : 'text-hull-grey/40'}">
 									{item.spread > 0 ? `+${item.spread.toLocaleString()}` : "-"}
@@ -307,9 +307,9 @@
 										<div class="grid gap-1.5">
 											<div class="grid grid-cols-[1fr,80px,60px,80px,60px,70px] gap-2 text-[10px] text-hull-grey uppercase tracking-wider pb-1 border-b border-hull-grey/15">
 												<span>Station</span>
-												<span class="text-right">Buy</span>
-												<span class="text-right">Qty</span>
 												<span class="text-right">Sell</span>
+												<span class="text-right">Qty</span>
+												<span class="text-right">Buy</span>
 												<span class="text-right">Qty</span>
 												<span class="text-right">Age</span>
 											</div>
@@ -319,17 +319,17 @@
 														<span class="w-1.5 h-1.5 rounded-full shrink-0 {freshnessDot(sp.fetchedAt)}"></span>
 														<span class="text-star-white truncate">{sp.stationName}</span>
 													</div>
-													<span class="text-right mono {sp.buyPrice > 0 && sp.buyPrice === item.bestBuy ? 'text-plasma-cyan font-medium' : 'text-chrome-silver'}">
-														{sp.buyPrice > 0 ? sp.buyPrice.toLocaleString() : "-"}
-													</span>
-													<span class="text-right mono text-hull-grey">
-														{sp.buyVolume > 0 ? sp.buyVolume : "-"}
-													</span>
-													<span class="text-right mono {sp.sellPrice > 0 && sp.sellPrice === item.bestSell ? 'text-shell-orange font-medium' : 'text-chrome-silver'}">
+													<span class="text-right mono {sp.sellPrice > 0 && sp.sellPrice === item.bestSell ? 'text-bio-green font-medium' : 'text-chrome-silver'}">
 														{sp.sellPrice > 0 ? sp.sellPrice.toLocaleString() : "-"}
 													</span>
 													<span class="text-right mono text-hull-grey">
 														{sp.sellVolume > 0 ? sp.sellVolume : "-"}
+													</span>
+													<span class="text-right mono {sp.buyPrice > 0 && sp.buyPrice === item.bestBuy ? 'text-claw-red font-medium' : 'text-chrome-silver'}">
+														{sp.buyPrice > 0 ? sp.buyPrice.toLocaleString() : "-"}
+													</span>
+													<span class="text-right mono text-hull-grey">
+														{sp.buyVolume > 0 ? sp.buyVolume : "-"}
 													</span>
 													<span class="text-right mono text-hull-grey text-[10px]">
 														{freshnessLabel(sp.fetchedAt)}
