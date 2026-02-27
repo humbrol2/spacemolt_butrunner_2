@@ -883,6 +883,7 @@ export async function ensureMinCredits(ctx: BotContext): Promise<{ withdrawn: nu
   try {
     await ctx.api.factionWithdrawCredits(deficit);
     await ctx.refreshState();
+    ctx.recordFactionWithdrawal(deficit); // Exclude from revenue tracking
     return { withdrawn: deficit, message: `withdrew ${deficit}cr from faction treasury (credits were below ${minCredits}cr minimum)` };
   } catch (err) {
     log(ctx, `faction withdraw failed: ${err instanceof Error ? err.message : String(err)}`);

@@ -1569,7 +1569,13 @@ function startBroadcastLoop(
         if (bot.status !== "running") continue;
         const prev = lastCredits.get(bot.botId);
         if (prev !== undefined) {
-          const delta = bot.credits - prev;
+          let delta = bot.credits - prev;
+          // Subtract faction treasury withdrawals — those aren't real revenue
+          const botObj = botManager.getBot(bot.botId);
+          const factionWithdrawal = botObj?.drainFactionWithdrawals() ?? 0;
+          if (factionWithdrawal > 0 && delta > 0) {
+            delta = Math.max(0, delta - factionWithdrawal);
+          }
           if (delta > 0) {
             economy.recordRevenue(delta);
             trainingLogger.logFinancialEvent("revenue", delta, bot.botId);

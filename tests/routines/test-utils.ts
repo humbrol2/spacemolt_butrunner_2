@@ -375,6 +375,7 @@ export function buildMockContext(overrides?: {
     refreshState: async () => {
       // No-op in tests - state is mutated directly
     },
+    recordFactionWithdrawal: () => {},
   };
 
   // Expose _shouldStop for test manipulation

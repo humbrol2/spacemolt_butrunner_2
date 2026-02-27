@@ -853,7 +853,7 @@ async function* factionSellLoop(
       } catch { /* non-critical */ }
     }
 
-    // Faction tax on profits
+    // Faction tax on sell profits
     const factionSellProfit = ctx.player.credits - factionSellCreditsBefore;
     if (factionSellProfit > 0) {
       const tax = await payFactionTax(ctx, factionSellProfit);

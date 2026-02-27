@@ -134,4 +134,7 @@ export interface BotContext {
 
   /** Update player/ship state from a fresh getStatus() call */
   refreshState: () => Promise<void>;
+
+  /** Record a faction treasury withdrawal (excluded from revenue tracking) */
+  recordFactionWithdrawal: (amount: number) => void;
 }

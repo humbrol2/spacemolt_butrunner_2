@@ -55,6 +55,9 @@ export class Bot {
   private _routineStartedAt: number = 0;
   private _rapidRoutines: Map<RoutineName, number> = new Map();
 
+  /** Credits withdrawn from faction treasury (not real revenue). Drained by broadcast loop. */
+  private _factionWithdrawals = 0;
+
   /** Full skill data (fetched via getSkills after login) */
   private _skills: Record<string, { level: number; xp: number; xpNext: number }> = {};
 
@@ -117,6 +120,16 @@ export class Bot {
   }
   get rapidRoutines(): Map<RoutineName, number> {
     return this._rapidRoutines;
+  }
+  /** Record a faction treasury withdrawal (not real revenue) */
+  recordFactionWithdrawal(amount: number): void {
+    this._factionWithdrawals += amount;
+  }
+  /** Drain accumulated faction withdrawals (returns and resets to 0) */
+  drainFactionWithdrawals(): number {
+    const amount = this._factionWithdrawals;
+    this._factionWithdrawals = 0;
+    return amount;
   }
   /** Skill levels as flat record (e.g. { mining: 3, trading: 1 }) */
   get skillLevels(): Record<string, number> {
@@ -387,6 +400,9 @@ export class Bot {
         const status = await deps.api.getStatus();
         bot._player = status.player;
         bot._ship = status.ship;
+      },
+      recordFactionWithdrawal: (amount: number) => {
+        bot.recordFactionWithdrawal(amount);
       },
     };
   }
