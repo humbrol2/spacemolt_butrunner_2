@@ -677,6 +677,29 @@ export class ApiClient {
     return (data.facilities ?? data.items ?? (Array.isArray(data) ? data : [])) as Array<Record<string, unknown>>;
   }
 
+  async factionInvite(playerIdOrUsername: string): Promise<Record<string, unknown>> {
+    return this.mutation("faction_invite", { player_id: playerIdOrUsername });
+  }
+
+  async factionGetInvites(): Promise<Array<{ factionId: string; factionName: string; factionTag: string; invitedBy: string }>> {
+    const data = await this.query<any>("faction_get_invites");
+    const invites = data.invites ?? data.pending ?? (Array.isArray(data) ? data : []);
+    return invites.map((inv: any) => ({
+      factionId: inv.faction_id ?? inv.factionId ?? "",
+      factionName: inv.faction_name ?? inv.factionName ?? inv.name ?? "",
+      factionTag: inv.faction_tag ?? inv.factionTag ?? inv.tag ?? "",
+      invitedBy: inv.invited_by ?? inv.invitedBy ?? "",
+    }));
+  }
+
+  async joinFaction(factionId: string): Promise<Record<string, unknown>> {
+    return this.mutation("join_faction", { faction_id: factionId });
+  }
+
+  async factionPromote(playerIdOrUsername: string, role: "recruit" | "member" | "officer" | "leader"): Promise<Record<string, unknown>> {
+    return this.mutation("faction_promote", { player_id: playerIdOrUsername, role_id: role });
+  }
+
   async factionDepositItems(itemId: string, quantity: number): Promise<Record<string, unknown>> {
     return this.mutation("faction_deposit_items", { item_id: itemId, quantity });
   }

@@ -22,6 +22,8 @@ import type { Database } from "bun:sqlite";
 
 const VERSION = "2.0.0";
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 // ── Load Configuration ──
 
 function loadConfig(): AppConfig {
@@ -476,6 +478,9 @@ async function main() {
           console.log(`  ${sys.id} "${sys.name}": ${stations.map((s) => `${s.baseId ?? "?"} (${s.baseName ?? s.name})`).join(", ")}`);
         }
       }
+
+      // Ensure all bots are in the same faction and promoted to officer
+      await ensureFactionMembership(botManager);
 
       // Auto-discover faction storage station if any bot uses faction_deposit mode
       const anyFactionMode = fleetStorageMode === "faction_deposit"
@@ -972,6 +977,118 @@ async function buildFactionState(
     console.warn("[Faction] Failed to build faction state:", err instanceof Error ? err.message : err);
     return null;
   }
+}
+
+/**
+ * Ensure all bots in the fleet are in the same faction and promoted to officer.
+ * Flow:
+ *   1. Find the "officer" bot — first bot that is already in a faction
+ *   2. Officer invites all bots that are NOT in the faction
+ *   3. Each invited bot checks for pending invites and accepts
+ *   4. Officer promotes all non-officer bots to officer rank
+ *
+ * Note: faction commands may require being docked. After login, bots are
+ * usually docked at their last position. If not, commands will fail gracefully.
+ * Mutations are rate-limited (1 per 10s per bot), so we add delays.
+ */
+async function ensureFactionMembership(botManager: BotManager): Promise<void> {
+  const allBots = botManager.getAllBots().filter(
+    (b) => b.player && b.api && (b.status === "ready" || b.status === "running")
+  );
+
+  if (allBots.length < 2) return; // Need at least 2 bots
+
+  // Find the officer: first bot already in a faction
+  const officer = allBots.find((b) => b.player!.factionId);
+  if (!officer) {
+    console.log("[Faction] No bot is in a faction — cannot auto-invite. Join a faction manually with at least one bot.");
+    return;
+  }
+
+  const factionId = officer.player!.factionId!;
+  const officerRank = officer.player!.factionRank ?? "member";
+  console.log(`[Faction] Officer: ${officer.username} (rank: ${officerRank}, faction: ${factionId})`);
+
+  // Check which bots need inviting
+  const needInvite = allBots.filter(
+    (b) => b.player!.factionId !== factionId
+  );
+
+  // Check which bots need promotion (already in faction but not officer/leader)
+  const needPromotion = allBots.filter(
+    (b) => b.player!.factionId === factionId
+      && b.player!.factionRank !== "officer"
+      && b.player!.factionRank !== "leader"
+      && b !== officer
+  );
+
+  if (needInvite.length === 0 && needPromotion.length === 0) {
+    console.log("[Faction] All bots are in faction and have proper rank");
+    return;
+  }
+
+  // Step 1: Officer invites non-faction bots
+  if (needInvite.length > 0) {
+    console.log(`[Faction] Inviting ${needInvite.length} bot(s): ${needInvite.map((b) => b.username).join(", ")}`);
+
+    for (const bot of needInvite) {
+      try {
+        await officer.api!.factionInvite(bot.username);
+        console.log(`[Faction] Invited ${bot.username}`);
+        await sleep(11_000); // Wait for next tick (rate limit)
+      } catch (err) {
+        console.warn(`[Faction] Failed to invite ${bot.username}: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+
+    // Step 2: Each invited bot checks invites and accepts
+    for (const bot of needInvite) {
+      try {
+        const invites = await bot.api!.factionGetInvites();
+        const match = invites.find((inv) => inv.factionId === factionId);
+        if (match) {
+          await bot.api!.joinFaction(factionId);
+          console.log(`[Faction] ${bot.username} joined faction`);
+          await sleep(11_000); // Rate limit
+        } else {
+          console.warn(`[Faction] ${bot.username} has no invite from faction ${factionId} (${invites.length} pending)`);
+        }
+      } catch (err) {
+        console.warn(`[Faction] ${bot.username} failed to join: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+
+    // Refresh player state for newly joined bots
+    for (const bot of needInvite) {
+      try {
+        const status = await bot.api!.getStatus();
+        // Player state is internal — trigger a light refresh
+      } catch {}
+    }
+  }
+
+  // Step 3: Promote all non-officer bots (only leader can promote)
+  const toPromote = [...needPromotion, ...needInvite]; // Newly joined + existing non-officers
+  if (toPromote.length > 0 && (officerRank === "leader" || officerRank === "officer")) {
+    // Only the leader can promote — check if officer is the leader
+    if (officerRank !== "leader") {
+      console.log(`[Faction] Officer ${officer.username} is ${officerRank}, not leader — cannot promote bots. Promote them manually.`);
+    } else {
+      console.log(`[Faction] Promoting ${toPromote.length} bot(s) to officer`);
+      for (const bot of toPromote) {
+        if (bot === officer) continue; // Don't promote self
+        try {
+          await officer.api!.factionPromote(bot.username, "officer");
+          console.log(`[Faction] Promoted ${bot.username} to officer`);
+          await sleep(11_000); // Rate limit
+        } catch (err) {
+          console.warn(`[Faction] Failed to promote ${bot.username}: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+    }
+  }
+
+  console.log("[Faction] Membership check complete");
 }
 
 // v2: invalidates old cached values from broken discovery that tagged the wrong station
