@@ -21,6 +21,7 @@ import type { ClientMessage, RoutineName, FleetStats, ServerMessage, EconomyStat
 import type { Database } from "bun:sqlite";
 
 const VERSION = "2.0.0";
+const BUILD = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14); // YYYYMMDDHHmmss
 
 // ── File Logging ──
 // Tee all console output to logs/commander.log (timestamped, rotates daily)
@@ -52,6 +53,19 @@ const VERSION = "2.0.0";
     logStream.write(line + "\n");
     origError.apply(console, args);
   };
+
+  // Startup banner — easy to spot in logs when reviewing
+  const banner = [
+    "",
+    "════════════════════════════════════════════════════════════════",
+    `  SPACEMOLT COMMANDER v${VERSION} (build ${BUILD})`,
+    `  Started: ${new Date().toISOString()}`,
+    `  Platform: ${process.platform} | Runtime: Bun ${typeof Bun !== "undefined" ? Bun.version : "?"}`,
+    "════════════════════════════════════════════════════════════════",
+    "",
+  ].join("\n");
+  logStream.write(banner + "\n");
+  origLog(banner);
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -602,7 +616,7 @@ async function main() {
   const stats = trainingLogger.getStats();
   console.log(`[Training] ${stats.decisions} decisions, ${stats.episodes} episodes, ${stats.marketRecords} market records`);
   console.log(`[Training] DB size: ${(stats.dbSizeBytes / 1024 / 1024).toFixed(1)} MB`);
-  console.log(`\n✓ Commander ready at http://${config.server.host}:${config.server.port}\n`);
+  console.log(`\n✓ Commander v${VERSION} (build ${BUILD}) ready at http://${config.server.host}:${config.server.port}\n`);
 }
 
 // ── Client Message Handler ──
@@ -1697,7 +1711,16 @@ function startBroadcastLoop(
   }, 3000);
 }
 
+// ── Graceful shutdown logging ──
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, () => {
+    console.log(`\n════ SHUTDOWN (${signal}) v${VERSION} build ${BUILD} at ${new Date().toISOString()} ════\n`);
+    process.exit(0);
+  });
+}
+
 main().catch((err) => {
   console.error("Fatal error:", err);
+  console.log(`\n════ CRASH v${VERSION} build ${BUILD} at ${new Date().toISOString()} ════\n`);
   process.exit(1);
 });
