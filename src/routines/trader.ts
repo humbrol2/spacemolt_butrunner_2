@@ -93,24 +93,40 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
     }
   }
 
-  // ── Auto-discover trade route ──
+  // ── Auto-discover trade routes (ranked by profitability) ──
+  type CandidateRoute = { itemId: string; itemName: string; buyStation: string; sellStation: string; buyPrice: number; sellPrice: number; profitPerUnit: number; volume: number; jumps: number };
+  const candidateRoutes: CandidateRoute[] = [];
+
   if (!buyStation || !sellStation || !item) {
-    yield "discovering trade route...";
+    yield "discovering trade routes...";
 
     // Use Commander's cached market data to find arbitrage
     const cachedStationIds = ctx.cache.getAllMarketFreshness().map((f) => f.stationId);
     if (cachedStationIds.length >= 2) {
       const routes = ctx.market.findArbitrage(cachedStationIds, ctx.player.currentSystem)
         .filter((r) => !r.itemId.startsWith("ore_")); // Traders don't trade ores
-      if (routes.length > 0) {
-        const best = routes[0];
-        if (!item) item = best.itemId;
-        if (!buyStation) buyStation = best.buyStationId;
-        if (!sellStation) sellStation = best.sellStationId;
-        maxBuyPrice = best.buyPrice; // Strict: don't pay more than cached price
-        minSellPrice = best.sellPrice * 0.9; // Allow 10% below cached sell price
-        yield `found route: buy ${best.itemName} @${best.buyPrice}cr → sell @${best.sellPrice}cr (+${best.profitPerUnit}cr/unit, ${best.volume > 0 ? best.volume + " avail" : "?"}, ${best.jumps} jump${best.jumps !== 1 ? "s" : ""})`;
+      for (const r of routes) {
+        candidateRoutes.push({
+          itemId: r.itemId, itemName: r.itemName,
+          buyStation: r.buyStationId, sellStation: r.sellStationId,
+          buyPrice: r.buyPrice, sellPrice: r.sellPrice,
+          profitPerUnit: r.profitPerUnit, volume: r.volume, jumps: r.jumps,
+        });
       }
+      if (candidateRoutes.length > 0) {
+        yield `found ${candidateRoutes.length} potential route(s)`;
+      }
+    }
+
+    // Use best route initially
+    if (candidateRoutes.length > 0) {
+      const best = candidateRoutes[0];
+      if (!item) item = best.itemId;
+      if (!buyStation) buyStation = best.buyStation;
+      if (!sellStation) sellStation = best.sellStation;
+      maxBuyPrice = best.buyPrice;
+      minSellPrice = best.sellPrice * 0.9;
+      yield `route 1/${candidateRoutes.length}: buy ${best.itemName} @${best.buyPrice}cr → sell @${best.sellPrice}cr (+${best.profitPerUnit}cr/unit, ${best.volume > 0 ? best.volume + " avail" : "?"}, ${best.jumps} jump${best.jumps !== 1 ? "s" : ""})`;
     }
 
     // Fallback: scan local market if docked — but only if there's a second station to sell at
@@ -198,6 +214,7 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
 
   let tripCount = 0;
   let lastBuyPrice = 0; // Track what we paid to verify profit at sell station
+  let routeIndex = 0; // Track which candidate route we're on
 
   while (!ctx.shouldStop && tripCount < maxRoundTrips) {
     // ── Safety check ──
@@ -375,10 +392,20 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
     // ── Navigate to sell station ──
     const cargoQty = ctx.cargo.getItemQuantity(ctx.ship, item);
     if (cargoQty === 0) {
-      yield "no cargo to sell, skipping trip";
+      // Try next candidate route before giving up
+      routeIndex++;
+      if (routeIndex < candidateRoutes.length) {
+        const next = candidateRoutes[routeIndex];
+        yield `route ${routeIndex}/${candidateRoutes.length} unprofitable, trying next: ${next.itemName} (+${next.profitPerUnit}cr/unit)`;
+        item = next.itemId;
+        buyStation = next.buyStation;
+        sellStation = next.sellStation;
+        maxBuyPrice = next.buyPrice;
+        minSellPrice = next.sellPrice * 0.9;
+        continue; // Re-enter loop with new route
+      }
+      yield "no profitable routes found";
       await refuelIfNeeded(ctx);
-      // Exit completely — if there's nothing profitable to buy, don't keep looping.
-      // Commander will reassign us when conditions change.
       yield "cycle_complete";
       return;
     }
