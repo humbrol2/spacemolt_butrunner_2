@@ -87,6 +87,15 @@ export class Crafting {
     return this.itemCatalog.get(itemId)?.category ?? "unknown";
   }
 
+  /** Find catalog items whose ID contains the given pattern */
+  findItemsByPattern(pattern: string): CatalogItem[] {
+    const results: CatalogItem[] = [];
+    for (const [id, item] of this.itemCatalog) {
+      if (id.includes(pattern)) results.push(item);
+    }
+    return results;
+  }
+
   /** Check if an item is craftable (is the output of at least one recipe) */
   isCraftable(itemId: string): boolean {
     return (this.outputIndex.get(itemId)?.length ?? 0) > 0;

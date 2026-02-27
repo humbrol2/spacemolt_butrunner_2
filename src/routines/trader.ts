@@ -377,9 +377,10 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
     if (cargoQty === 0) {
       yield "no cargo to sell, skipping trip";
       await refuelIfNeeded(ctx);
-      tripCount++;
+      // Exit completely — if there's nothing profitable to buy, don't keep looping.
+      // Commander will reassign us when conditions change.
       yield "cycle_complete";
-      continue;
+      return;
     }
 
     yield "traveling to sell station";

@@ -844,10 +844,8 @@ export class ScoringBrain implements CommanderBrain {
         };
       case "trader":
         return this.buildTraderParams(bot, economy, existingAssignments, world);
-      case "explorer": {
-        const explorerIndex = existingAssignments.filter(a => a.routine === "explorer").length;
-        return { targetSystems: [], submitIntel: true, explorerIndex };
-      }
+      case "explorer":
+        return this.buildExplorerParams(bot, economy, existingAssignments);
       case "crafter":
         return this.buildCrafterParams(bot, economy, existingAssignments);
       case "hunter":
@@ -1071,6 +1069,31 @@ export class ScoringBrain implements CommanderBrain {
     }
 
     return baseParams;
+  }
+
+  /**
+   * Build explorer params — equip survey scanner if available in faction storage.
+   */
+  private buildExplorerParams(
+    bot: FleetBotInfo,
+    economy: EconomySnapshot,
+    existingAssignments: Assignment[],
+  ): Record<string, unknown> {
+    const explorerIndex = existingAssignments.filter(a => a.routine === "explorer").length;
+    const equipModules: string[] = [];
+
+    // Equip survey scanner if bot doesn't have one and faction storage has one
+    const hasSurvey = bot.moduleIds.some((id) => id.includes("survey"));
+    if (!hasSurvey) {
+      // Check faction storage for a survey scanner
+      const surveyInStorage = [...economy.factionStorage.entries()]
+        .some(([itemId, qty]) => itemId.includes("survey") && qty > 0);
+      if (surveyInStorage) {
+        equipModules.push("survey");
+      }
+    }
+
+    return { targetSystems: [], submitIntel: true, explorerIndex, equipModules };
   }
 
   /**

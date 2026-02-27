@@ -104,7 +104,11 @@ export async function* quartermaster(ctx: BotContext): AsyncGenerator<string, vo
     if (ctx.shouldStop) return;
 
     // ── 3. Check and collect filled buy orders ──
-    // (modules we ordered previously might have been filled)
+    // Modules bought via buy orders arrive in cargo — deposit them to faction storage
+    yield* collectFilledOrders(ctx);
+
+    if (ctx.shouldStop) return;
+
     await refuelIfNeeded(ctx);
 
     // Slow cycle — quartermaster doesn't need to rush
@@ -316,17 +320,28 @@ async function* buyEquipmentModules(
     return;
   }
 
-  // Count modules per target type
-  const targets = MODULE_TARGETS.map((t) => ({
-    ...t,
-    target: Math.min(t.target, targetCount), // Respect param override
-    count: storageItems
+  // Count modules per target type (faction storage + equipped on fleet bots)
+  const fleet = ctx.getFleetStatus();
+  const targets = MODULE_TARGETS.map((t) => {
+    const inStorage = storageItems
       .filter((s) => s.itemId.includes(t.pattern))
-      .reduce((sum, s) => sum + s.quantity, 0),
-  }));
+      .reduce((sum, s) => sum + s.quantity, 0);
+    const equippedOnBots = fleet.bots
+      .filter((b) => b.moduleIds.some((m) => m.includes(t.pattern)))
+      .length;
+    return {
+      ...t,
+      target: Math.min(t.target, targetCount), // Respect param override
+      count: inStorage + equippedOnBots,
+      inStorage,
+      equippedOnBots,
+    };
+  });
 
   // Report inventory
-  const inv = targets.map((t) => `${t.label}: ${t.count}/${t.target}`).join(", ");
+  const inv = targets.map((t) =>
+    `${t.label}: ${t.count}/${t.target} (${t.inStorage} stored, ${t.equippedOnBots} equipped)`
+  ).join(", ");
   yield `modules: ${inv}`;
 
   // Find what's still needed
@@ -383,18 +398,56 @@ async function* buyEquipmentModules(
         yield `${target.label} @ ${cheapest.priceEach}cr exceeds budget (${budget}cr)`;
       }
     } else {
+      // Check if we already have a buy order for this module type
+      const existingBuyOrder = localMarket.some(
+        (o) => o.type === "buy" && o.playerId === ctx.player.id && o.itemId.includes(target.pattern),
+      );
+      if (existingBuyOrder) {
+        yield `${target.label}: buy order already placed, waiting for fill`;
+        continue;
+      }
+
       // No modules on local market — place a buy order to attract sellers
-      const basePrice = ctx.crafting.getItemBasePrice(target.pattern);
+      // Need exact item ID from catalog (pattern alone isn't a valid item ID)
+      const catalogItems = ctx.crafting.findItemsByPattern(target.pattern);
+      const exactItem = catalogItems.length > 0 ? catalogItems[0] : null;
+      const exactId = exactItem?.id ?? target.pattern;
+      const basePrice = exactItem?.basePrice ?? ctx.crafting.getItemBasePrice(target.pattern);
       const offerPrice = basePrice > 0 ? Math.ceil(basePrice * 1.1) : 0; // 10% above base to attract
       if (offerPrice > 0 && offerPrice <= budget) {
         try {
-          await ctx.api.createBuyOrder(target.pattern, 1, offerPrice);
-          yield `buy order: 1x ${target.label} @ ${offerPrice}cr (attracting sellers)`;
+          await ctx.api.createBuyOrder(exactId, 1, offerPrice);
+          yield `buy order: 1x ${target.label} (${exactId}) @ ${offerPrice}cr (attracting sellers)`;
           return; // One order per cycle
         } catch (err) {
           yield `buy order failed: ${err instanceof Error ? err.message : String(err)}`;
         }
       }
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Filled Order Collection
+// ════════════════════════════════════════════════════════════════════
+
+/**
+ * Check cargo for module items that arrived via filled buy orders.
+ * Deposit them to faction storage so fleet bots can withdraw and equip.
+ */
+async function* collectFilledOrders(
+  ctx: BotContext,
+): AsyncGenerator<string, void, void> {
+  await ctx.refreshState();
+  for (const item of ctx.ship.cargo) {
+    if (ctx.shouldStop) return;
+    if (!isModuleItem(item.itemId)) continue;
+    try {
+      await ctx.api.factionDepositItems(item.itemId, item.quantity);
+      await ctx.refreshState();
+      yield `deposited ${item.quantity}x ${item.itemId} to faction storage (filled order)`;
+    } catch (err) {
+      yield `deposit failed for ${item.itemId}: ${err instanceof Error ? err.message : String(err)}`;
     }
   }
 }
