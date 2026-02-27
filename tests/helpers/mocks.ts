@@ -166,8 +166,10 @@ export class MockTrainingLogger {
 // ── Mock Game Cache ──
 
 export class MockGameCache {
-  getMarketPrices(_stationId: string) {
-    return null;
+  marketPricesData = new Map<string, Array<{ itemId: string; buyPrice: number; sellPrice: number }>>();
+
+  getMarketPrices(stationId: string) {
+    return this.marketPricesData.get(stationId) ?? null;
   }
   setMarketPrices() {}
   getSystemDetail(_id: string) {

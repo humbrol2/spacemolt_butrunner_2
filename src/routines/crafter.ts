@@ -36,6 +36,7 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<string, void, vo
   const craftStation = getParam(ctx, "craftStation", "");
   const materialSource = getParam<string>(ctx, "materialSource", "cargo");
   const sellOutput = getParam(ctx, "sellOutput", true);
+  let skillTraining = false;
 
   // ── Recipe discovery ──
   if (!recipeId) {
@@ -67,6 +68,7 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<string, void, vo
     const easiest = ctx.crafting.findEasiestRecipe(ctx.player.skills);
     if (easiest && easiest.skillGap <= 2) {
       recipeId = easiest.recipe.id;
+      skillTraining = true;
       yield `skill training: attempting ${easiest.recipe.name} (gap: ${easiest.missingSkills.join(", ")})`;
     } else {
       yield `no craftable recipes (${available} available of ${total} total, skill-gated${easiest ? `, easiest needs: ${easiest.missingSkills.join(", ")}` : ""})`;
@@ -126,7 +128,7 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<string, void, vo
     if (ctx.shouldStop) return;
 
     // ── Source materials ──
-    const sourced = await sourceMaterials(ctx, recipe, count, materialSource);
+    const sourced = await sourceMaterials(ctx, recipe, count, materialSource, skillTraining);
     if (!sourced.ok) {
       yield sourced.reason;
       yield "cycle_complete";
@@ -153,7 +155,7 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<string, void, vo
         // Try sourcing missing materials for this specific step
         const stepRecipe = ctx.crafting.getRecipe(step.recipeId);
         if (stepRecipe) {
-          const stepSourced = await sourceMaterials(ctx, stepRecipe, step.batchCount, materialSource);
+          const stepSourced = await sourceMaterials(ctx, stepRecipe, step.batchCount, materialSource, skillTraining);
           if (!stepSourced.ok) {
             yield `missing materials for ${step.recipeName}: ${stepSourced.reason}`;
             yield "cycle_complete";
@@ -269,13 +271,14 @@ async function sourceMaterials(
   recipe: { id: string; ingredients: Array<{ itemId: string; quantity: number }> },
   batchCount: number,
   preferredSource: string,
+  skipSkillCheck = false,
 ): Promise<SourceResult> {
   const plan = ctx.crafting.planCraft(recipe.id, batchCount, ctx.ship, ctx.player.skills);
   if (!plan) return { ok: false, reason: "could not create crafting plan", messages: [] };
   if (plan.canCraft) return { ok: true, reason: "", messages: [] };
 
-  // Check skill requirements first
-  if (plan.missingSkills.length > 0) {
+  // Check skill requirements first (skip when in skill training mode — let API decide)
+  if (!skipSkillCheck && plan.missingSkills.length > 0) {
     const missing = plan.missingSkills.map((s) => `${s.skillId} (need ${s.required}, have ${s.current})`).join(", ");
     return { ok: false, reason: `missing skills: ${missing}`, messages: [] };
   }

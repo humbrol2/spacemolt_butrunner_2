@@ -73,8 +73,8 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
         if (!item) item = best.itemId;
         if (!buyStation) buyStation = best.buyStationId;
         if (!sellStation) sellStation = best.sellStationId;
-        maxBuyPrice = best.buyPrice * 1.1; // Allow 10% above cached price
-        minSellPrice = best.sellPrice * 0.9; // Allow 10% below cached price
+        maxBuyPrice = best.buyPrice; // Strict: don't pay more than cached price
+        minSellPrice = best.sellPrice * 0.9; // Allow 10% below cached sell price
         yield `found route: buy ${best.itemName} @${best.buyPrice}cr → sell @${best.sellPrice}cr (+${best.profitPerUnit}cr/unit, ${best.volume > 0 ? best.volume + " avail" : "?"}, ${best.jumps} jump${best.jumps !== 1 ? "s" : ""})`;
       }
     }
@@ -126,19 +126,9 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
               }
             }
 
-            // No demand-verified pick — fall back to cheapest non-ore tradeable item
-            // Only pick cheap items to limit risk when we have no demand data
+            // No demand-verified pick — do NOT buy without confirmed sell price
             if (!item) {
-              const cheapSafe = sellOrders
-                .filter((o) => o.priceEach <= 500 && !o.itemId.startsWith("ore_"))
-                .sort((a, b) => a.priceEach - b.priceEach); // Cheapest first (minimize loss risk)
-              const pick = cheapSafe[0];
-              if (pick) {
-                item = pick.itemId;
-                yield `trading (no demand data): ${pick.itemName} (${pick.priceEach}cr/unit, capped risk)`;
-              } else {
-                yield "no cheap items to trade without demand data";
-              }
+              yield "no items with confirmed profitable sell destination";
             }
           }
         }
@@ -277,10 +267,11 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
       // Get item size (weight per unit) from cargo if we already have some, else default 1
       const itemSize = ctx.cargo.getItemSize(ctx.ship, item);
 
-      // Pre-buy profit check: verify sell station has demand at a profitable price
+      // Pre-buy profit check: REQUIRE known sell price > buy price
       const sellStationPrices = ctx.cache.getMarketPrices(sellStation);
       const expectedSellPrice = sellStationPrices?.find((p) => p.itemId === item)?.sellPrice ?? 0;
-      const wouldLose = expectedSellPrice > 0 && bestPrice > 0 && expectedSellPrice < bestPrice;
+      const noSellData = expectedSellPrice <= 0;
+      const wouldLose = bestPrice > 0 && (noSellData || expectedSellPrice < bestPrice);
 
       if (buyOrders.length === 0) {
         yield `no sell orders for ${item} at this station, skipping buy`;
@@ -289,7 +280,9 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
       } else if (bestPrice > maxBuyPrice && maxBuyPrice < Infinity) {
         yield `price too high (${bestPrice} > max ${maxBuyPrice}), skipping buy`;
       } else if (wouldLose) {
-        yield `unprofitable: buy ${bestPrice}cr > sell ${expectedSellPrice}cr for ${item}, skipping`;
+        yield noSellData
+          ? `no sell price data for ${item} at sell station, skipping (won't buy blind)`
+          : `unprofitable: buy ${bestPrice}cr > sell ${expectedSellPrice}cr for ${item}, skipping`;
       } else {
         // Weight-aware: divide free cargo weight by per-unit size
         let buyQty = Math.floor(freeWeight / Math.max(1, itemSize));
@@ -648,13 +641,35 @@ async function* factionSellLoop(
       }
     }
 
-    // Fallback: try selling at any nearby station
+    // Fallback: try local station ONLY if it has cached demand for this item
     if (!targetStation) {
       const system = await ctx.api.getSystem();
-      const otherStation = system.pois.find((p) => p.hasBase && p.baseId && p.baseId !== factionStation);
-      if (otherStation?.baseId) {
-        targetStation = otherStation.baseId;
-        yield `no cached demand data, trying ${otherStation.baseName ?? otherStation.name}`;
+      for (const poi of system.pois) {
+        if (!poi.hasBase || !poi.baseId || poi.baseId === factionStation) continue;
+        const prices = ctx.cache.getMarketPrices(poi.baseId);
+        const itemPrice = prices?.find((p) => p.itemId === withdrawnItem);
+        if (itemPrice?.sellPrice && itemPrice.sellPrice > 0) {
+          targetStation = poi.baseId;
+          bestSellPrice = itemPrice.sellPrice;
+          yield `found local demand: ${poi.baseName ?? poi.name} @ ${bestSellPrice}cr`;
+          break;
+        }
+      }
+      if (!targetStation) {
+        yield `no station with confirmed demand for ${ctx.crafting.getItemName(withdrawnItem)}, re-depositing`;
+        // Return items to faction storage
+        const qty = ctx.cargo.getItemQuantity(ctx.ship, withdrawnItem);
+        if (qty > 0 && ctx.player.dockedAtBase) {
+          try {
+            await ctx.api.factionDepositItems(withdrawnItem, qty);
+            await ctx.refreshState();
+            yield `re-deposited ${qty} ${ctx.crafting.getItemName(withdrawnItem)}`;
+          } catch {}
+        }
+        await refuelIfNeeded(ctx);
+        tripCount++;
+        yield "cycle_complete";
+        continue;
       }
     }
 

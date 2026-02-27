@@ -1,6 +1,13 @@
 import { describe, test, expect } from "bun:test";
 import { trader } from "../../src/routines/trader";
 import { buildMockContext, collectYields, runUntilYield } from "./test-utils";
+import { MockGameCache } from "../helpers/mocks";
+
+/** Set up sell station prices so trader's profit guard passes */
+function setSellStationPrices(ctx: any, stationId: string, items: Array<{ itemId: string; sellPrice: number }>) {
+  const cache = ctx.cache as MockGameCache;
+  cache.marketPricesData.set(stationId, items.map((i) => ({ itemId: i.itemId, buyPrice: 0, sellPrice: i.sellPrice })));
+}
 
 describe("Trader Routine", () => {
   test("auto-discovers trade route when params empty", async () => {
@@ -20,6 +27,9 @@ describe("Trader Routine", () => {
       player: { currentSystem: "sol", currentPoi: "sol_earth", dockedAtBase: "base_earth", credits: 10000 },
       ship: { cargoCapacity: 50, cargoUsed: 0, cargo: [] },
     });
+
+    // Provide cached sell prices so profit guard passes (sell 50 > buy 25)
+    setSellStationPrices(ctx, "base_alpha", [{ itemId: "refined_steel", sellPrice: 50 }]);
 
     const yields = await collectYields(trader(ctx));
 
@@ -50,6 +60,9 @@ describe("Trader Routine", () => {
       ship: { cargoCapacity: 50, cargoUsed: 0, cargo: [] },
     });
 
+    // Provide cached sell prices so profit guard passes
+    setSellStationPrices(ctx, "base_alpha", [{ itemId: "refined_steel", sellPrice: 50 }]);
+
     const yields = await collectYields(trader(ctx));
 
     expect(yields.some((y) => y.includes("buy order placed"))).toBe(true);
@@ -68,6 +81,9 @@ describe("Trader Routine", () => {
       ship: { cargoCapacity: 50, cargoUsed: 0, cargo: [] },
     });
 
+    // Provide cached sell prices so profit guard passes
+    setSellStationPrices(ctx, "base_alpha", [{ itemId: "refined_steel", sellPrice: 50 }]);
+
     const yields = await collectYields(trader(ctx));
     const cycleCompletes = yields.filter((y) => y === "cycle_complete");
     expect(cycleCompletes.length).toBe(2);
@@ -85,6 +101,9 @@ describe("Trader Routine", () => {
       player: { currentSystem: "sol", currentPoi: "sol_earth", dockedAtBase: "base_earth" },
       ship: { fuel: 5, maxFuel: 100, cargoCapacity: 50, cargoUsed: 0, cargo: [] },
     });
+
+    // Provide cached sell prices so profit guard passes
+    setSellStationPrices(ctx, "base_alpha", [{ itemId: "refined_steel", sellPrice: 50 }]);
 
     const yields = await collectYields(trader(ctx), 20);
     expect(yields.some((y) => y.includes("emergency"))).toBe(true);
