@@ -28,6 +28,7 @@ import {
   recordSellResult,
   payFactionTax,
   ensureMinCredits,
+  interruptibleSleep,
 } from "./helpers";
 
 export async function* crafter(ctx: BotContext): AsyncGenerator<string, void, void> {
@@ -130,9 +131,10 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<string, void, vo
     // ── Source materials ──
     const sourced = await sourceMaterials(ctx, recipe, count, materialSource, skillTraining);
     if (!sourced.ok) {
-      yield sourced.reason;
+      yield `${sourced.reason} — waiting for materials`;
+      await interruptibleSleep(ctx, 120_000); // Wait 2 min for miners/crafters to produce
       yield "cycle_complete";
-      return;
+      continue; // Retry — materials may appear in faction storage
     }
     for (const msg of sourced.messages) {
       yield msg;
@@ -141,6 +143,7 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<string, void, vo
     if (ctx.shouldStop) return;
 
     // ── Craft chain (intermediates first, then final product) ──
+    let chainFailed = false;
     for (const step of chain) {
       if (ctx.shouldStop) return;
 
@@ -157,9 +160,9 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<string, void, vo
         if (stepRecipe) {
           const stepSourced = await sourceMaterials(ctx, stepRecipe, step.batchCount, materialSource, skillTraining);
           if (!stepSourced.ok) {
-            yield `missing materials for ${step.recipeName}: ${stepSourced.reason}`;
-            yield "cycle_complete";
-            return;
+            yield `missing materials for ${step.recipeName}: ${stepSourced.reason} — waiting`;
+            chainFailed = true;
+            break; // Exit chain loop — will wait and retry
           }
           for (const msg of stepSourced.messages) {
             yield msg;
@@ -189,12 +192,20 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<string, void, vo
         }
       } catch (err) {
         yield `craft failed: ${err instanceof Error ? err.message : String(err)}`;
-        yield "cycle_complete";
-        return;
+        chainFailed = true;
+        break; // Exit chain loop — will wait and retry
       }
     }
 
     if (ctx.shouldStop) return;
+
+    // Chain failed — wait and retry (materials may appear from miners/crafters)
+    if (chainFailed) {
+      yield "waiting for materials before retrying chain...";
+      await interruptibleSleep(ctx, 120_000);
+      yield "cycle_complete";
+      continue;
+    }
 
     // ── Sell or deposit output ──
     if (sellOutput) {

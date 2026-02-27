@@ -34,6 +34,7 @@ import {
   adjustMarketCache,
   payFactionTax,
   ensureMinCredits,
+  interruptibleSleep,
 } from "./helpers";
 
 export async function* trader(ctx: BotContext): AsyncGenerator<string, void, void> {
@@ -192,9 +193,9 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
     }
   }
 
-  // If we still can't figure out a route, sell cargo and idle
+  // If we still can't figure out a route, sell cargo and wait for market data
   if (!buyStation || !sellStation || !item) {
-    yield "no trade route found";
+    yield "no trade route found — waiting for market data";
     if (ctx.ship.cargo.length > 0) {
       try {
         if (!ctx.player.dockedAtBase) await findAndDock(ctx);
@@ -208,6 +209,7 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
       } catch {}
     }
     await refuelIfNeeded(ctx);
+    await interruptibleSleep(ctx, 120_000);
     yield "cycle_complete";
     return;
   }
@@ -404,8 +406,9 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
         minSellPrice = next.sellPrice * 0.9;
         continue; // Re-enter loop with new route
       }
-      yield "no profitable routes found";
+      yield "no profitable routes found — waiting for new opportunities";
       await refuelIfNeeded(ctx);
+      await interruptibleSleep(ctx, 120_000);
       yield "cycle_complete";
       return;
     }
@@ -656,8 +659,9 @@ async function* factionSellLoop(
       await navigateAndDock(ctx, factionStation);
     } catch (err) {
       yield `navigation failed: ${err instanceof Error ? err.message : String(err)}`;
+      await interruptibleSleep(ctx, 60_000);
       yield "cycle_complete";
-      return;
+      continue;
     }
 
     if (ctx.shouldStop) return;
@@ -676,27 +680,41 @@ async function* factionSellLoop(
     }
 
     if (storageItems.length === 0) {
-      yield "faction storage empty, waiting";
+      yield "faction storage empty — waiting for crafters to produce";
+      await interruptibleSleep(ctx, 120_000);
       yield "cycle_complete";
-      return;
+      continue;
     }
 
-    // Rank items by base catalog price (higher value = better to sell)
+    // Rank items by value (catalog price or cached market price as fallback)
     // Skip raw ores — those are for crafters
+    const cachedStations = ctx.cache.getAllMarketFreshness().map((f) => f.stationId);
     const sellable = storageItems
       .filter((s) => !s.itemId.startsWith("ore_"))
-      .map((s) => ({
-        ...s,
-        basePrice: ctx.crafting.getItemBasePrice(s.itemId),
-        name: ctx.crafting.getItemName(s.itemId),
-      }))
+      .map((s) => {
+        let bestPrice = ctx.crafting.getItemBasePrice(s.itemId);
+        // Fallback: check cached market data for actual sell prices
+        if (bestPrice <= 0) {
+          for (const sid of cachedStations) {
+            const prices = ctx.cache.getMarketPrices(sid);
+            const sellPrice = prices?.find((p) => p.itemId === s.itemId)?.sellPrice ?? 0;
+            if (sellPrice > bestPrice) bestPrice = sellPrice;
+          }
+        }
+        return {
+          ...s,
+          basePrice: bestPrice,
+          name: ctx.crafting.getItemName(s.itemId),
+        };
+      })
       .filter((s) => s.basePrice > 0)
       .sort((a, b) => (b.basePrice * b.quantity) - (a.basePrice * a.quantity)); // Total value
 
     if (sellable.length === 0) {
-      yield "no sellable items in faction storage (only ores)";
+      yield "no sellable items in faction storage (only ores) — waiting";
+      await interruptibleSleep(ctx, 120_000);
       yield "cycle_complete";
-      return;
+      continue;
     }
 
     // ── Withdraw the most valuable item(s) ──
@@ -733,9 +751,10 @@ async function* factionSellLoop(
     }
 
     if (!withdrawnItem || withdrawnQty <= 0) {
-      yield "could not withdraw any items";
+      yield "could not withdraw any items — waiting";
+      await interruptibleSleep(ctx, 120_000);
       yield "cycle_complete";
-      return;
+      continue;
     }
 
     if (ctx.shouldStop) return;
@@ -816,8 +835,18 @@ async function* factionSellLoop(
       await navigateAndDock(ctx, targetStation);
     } catch (err) {
       yield `navigation failed: ${err instanceof Error ? err.message : String(err)}`;
+      // Re-deposit items if we can't reach sell station
+      const reDepositQty = ctx.cargo.getItemQuantity(ctx.ship, withdrawnItem);
+      if (reDepositQty > 0 && ctx.player.dockedAtBase) {
+        try {
+          await ctx.api.factionDepositItems(withdrawnItem, reDepositQty);
+          await ctx.refreshState();
+          yield `re-deposited ${reDepositQty} ${ctx.crafting.getItemName(withdrawnItem)}`;
+        } catch { /* best effort */ }
+      }
+      await interruptibleSleep(ctx, 60_000);
       yield "cycle_complete";
-      return;
+      continue;
     }
 
     if (ctx.shouldStop) return;

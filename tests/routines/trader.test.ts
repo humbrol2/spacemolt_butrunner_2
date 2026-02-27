@@ -63,7 +63,8 @@ describe("Trader Routine", () => {
     // Provide cached sell prices so profit guard passes
     setSellStationPrices(ctx, "base_alpha", [{ itemId: "refined_steel", sellPrice: 50 }]);
 
-    const yields = await collectYields(trader(ctx));
+    // Order-based buy doesn't add cargo, so routine will try next route then wait — stop after order placed
+    const yields = await runUntilYield(ctx, trader(ctx), "buy order placed");
 
     expect(yields.some((y) => y.includes("buy order placed"))).toBe(true);
     expect(tracker.calls.some((c) => c.startsWith("createBuyOrder:"))).toBe(true);

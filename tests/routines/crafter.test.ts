@@ -64,10 +64,10 @@ describe("Crafter Routine", () => {
       ship: { cargo: [], cargoUsed: 0 },
     });
 
-    const yields = await collectYields(crafter(ctx));
+    // Routine now waits and retries on missing materials — stop when it reports the shortage
+    const yields = await runUntilYield(ctx, crafter(ctx), "waiting for materials");
 
     expect(yields.some((y) => y.includes("need") && y.includes("more"))).toBe(true);
-    expect(yields).toContain("cycle_complete");
   });
 
   test("sells output when sellOutput is true", async () => {

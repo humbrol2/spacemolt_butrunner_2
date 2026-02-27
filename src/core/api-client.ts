@@ -821,6 +821,14 @@ export class ApiClient {
             this.onSessionExpired?.();
           }
 
+          // Action still resolving from previous tick — wait and retry
+          if (data.error.code === "action_in_progress" && attempt < MAX_RETRIES) {
+            const waitMs = (data.error.wait_seconds ?? 12) * 1000;
+            console.log(`[API] ${cmd} action_in_progress, waiting ${waitMs / 1000}s (attempt ${attempt + 1}/${MAX_RETRIES})`);
+            await sleep(waitMs);
+            continue;
+          }
+
           throw new ApiError(data.error.code, data.error.message, data.error.wait_seconds);
         }
 
