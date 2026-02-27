@@ -290,6 +290,11 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
           const maxByCredits = Math.floor(ctx.player.credits / bestPrice);
           buyQty = Math.min(buyQty, maxByCredits, availableQty || buyQty);
         }
+        // Cap by known sell demand volume — don't buy more than we can sell
+        const sellDemandVol = sellStationPrices?.find((p) => p.itemId === item)?.sellVolume ?? 0;
+        if (sellDemandVol > 0) {
+          buyQty = Math.min(buyQty, sellDemandVol);
+        }
 
         if (buyQty <= 0) {
           yield `cannot afford ${item} (${bestPrice}cr each, have ${ctx.player.credits}cr)`;
@@ -436,29 +441,78 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
             }
           } else {
             const cargoBeforeSell = ctx.cargo.getItemQuantity(ctx.ship, item);
+            const creditsBefore = ctx.player.credits;
             const result = await ctx.api.sell(item, qty);
             await ctx.refreshState();
             const cargoAfterSell = ctx.cargo.getItemQuantity(ctx.ship, item);
-            if (result.priceEach === 0 && result.total === 0) {
+            const creditsGained = ctx.player.credits - creditsBefore;
+
+            // Detect actual sell even if API returns 0 (check credit change)
+            const actuallySold = creditsGained > 0 || (cargoAfterSell < cargoBeforeSell);
+
+            if (!actuallySold && result.priceEach === 0 && result.total === 0) {
               yield `no demand for ${item} at this station`;
-              // No demand — deposit to faction storage instead of holding
-              const factionStation = ctx.fleetConfig.factionStorageStation || ctx.fleetConfig.homeBase;
-              if (ctx.player.dockedAtBase) {
-                try {
-                  await ctx.api.factionDepositItems(item, qty);
-                  await ctx.refreshState();
-                  yield `deposited ${qty} ${item} to faction storage (no demand here)`;
-                } catch {
-                  // Not a faction storage station — will try next cycle
+
+              // Invalidate cached sell price so we don't route here again
+              adjustMarketCache(ctx, sellStation, item, "sell", qty);
+
+              // Try other stations with cached demand before dumping
+              const remainingQty = ctx.cargo.getItemQuantity(ctx.ship, item);
+              if (remainingQty > 0) {
+                let soldElsewhere = false;
+                const cachedStationIds = ctx.cache.getAllMarketFreshness().map((f) => f.stationId);
+                for (const altStation of cachedStationIds) {
+                  if (altStation === sellStation) continue;
+                  const altPrices = ctx.cache.getMarketPrices(altStation);
+                  const altSellPrice = altPrices?.find((p) => p.itemId === item)?.sellPrice ?? 0;
+                  if (altSellPrice > 0 && (lastBuyPrice === 0 || altSellPrice >= lastBuyPrice)) {
+                    yield `trying alternate station (sell @${altSellPrice}cr)`;
+                    try {
+                      await navigateAndDock(ctx, altStation);
+                      const altResult = await ctx.api.sell(item, remainingQty);
+                      await ctx.refreshState();
+                      if (altResult.total > 0) {
+                        yield `sold ${altResult.quantity} ${item} @ ${altResult.priceEach}cr at alternate station (total: ${altResult.total}cr)`;
+                        recordSellResult(ctx, altStation, altResult.itemId || item, item, altResult.priceEach, altResult.quantity);
+                        soldElsewhere = true;
+                        break;
+                      }
+                    } catch {
+                      // Try next station
+                    }
+                  }
+                }
+
+                // Last resort: deposit to faction storage
+                if (!soldElsewhere) {
+                  const finalQty = ctx.cargo.getItemQuantity(ctx.ship, item);
+                  if (finalQty > 0 && ctx.player.dockedAtBase) {
+                    try {
+                      await ctx.api.factionDepositItems(item, finalQty);
+                      await ctx.refreshState();
+                      yield `deposited ${finalQty} ${item} to faction storage (no buyers found)`;
+                    } catch {
+                      // Not a faction storage station — will try next cycle
+                    }
+                  }
                 }
               }
             } else {
+              // Successful sell — use actual credit gain if API response was weird
+              const soldQty = actuallySold && result.quantity === 0
+                ? cargoBeforeSell - cargoAfterSell
+                : result.quantity;
+              const soldPrice = creditsGained > 0 && result.priceEach === 0
+                ? Math.round(creditsGained / Math.max(1, soldQty))
+                : result.priceEach;
+              const soldTotal = creditsGained > 0 ? creditsGained : result.total;
+
               if (cargoAfterSell >= cargoBeforeSell && result.quantity > 0) {
                 yield `sell warning: API reports ${result.quantity} sold but cargo unchanged (${cargoBeforeSell} → ${cargoAfterSell})`;
               }
-              yield `sold ${result.quantity} ${item} @ ${result.priceEach}cr (total: ${result.total}cr)`;
-              recordSellResult(ctx, sellStation, result.itemId || item, item, result.priceEach, result.quantity);
-              adjustMarketCache(ctx, sellStation, item, "sell", result.quantity);
+              yield `sold ${soldQty} ${item} @ ${soldPrice}cr (total: ${soldTotal}cr)`;
+              recordSellResult(ctx, sellStation, result.itemId || item, item, soldPrice, soldQty);
+              adjustMarketCache(ctx, sellStation, item, "sell", soldQty);
             }
           }
         } catch (err) {
