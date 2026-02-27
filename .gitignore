@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+web/node_modules/
+
+# Build output
+dist/
+web/.svelte-kit/
+web/build/
+
+# Database files (contain credentials, session tokens, training data)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+data/commander.db
+data/commander.db-shm
+data/commander.db-wal
+commander.db
+
+# Data directory (API responses, sessions, debug dumps)
+data/sessions/
+data/*.json
+
+# Environment & credentials
+.env
+.env.*
+!.env.example
+*.toml
+secrets.*
+credentials.*
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude memory (personal context)
+.claude/
