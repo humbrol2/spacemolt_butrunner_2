@@ -153,8 +153,8 @@
 					></span>
 					<span class="mono">{$fleetStats.activeBots}/{$fleetStats.totalBots}</span>
 				</span>
-				<span class="text-bio-green mono font-medium">
-					+{$fleetStats.creditsPerHour.toLocaleString()} cr/hr
+				<span class="{$fleetStats.creditsPerHour >= 0 ? 'text-bio-green' : 'text-claw-red'} mono font-medium">
+					{$fleetStats.creditsPerHour >= 0 ? '+' : ''}{$fleetStats.creditsPerHour.toLocaleString()} cr/hr
 				</span>
 			{:else}
 				<span class="text-hull-grey">No data</span>

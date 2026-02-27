@@ -32,8 +32,12 @@
 		</div>
 		<div class="card p-4">
 			<p class="text-xs text-chrome-silver uppercase tracking-wider">Income Rate</p>
-			<p class="text-2xl font-bold mono text-bio-green mt-1">
-				{$fleetStats ? `+${$fleetStats.creditsPerHour.toLocaleString()}` : "---"}
+			<p class="text-2xl font-bold mono {$fleetStats && $fleetStats.creditsPerHour >= 0 ? 'text-bio-green' : 'text-claw-red'} mt-1">
+				{#if $fleetStats}
+					{$fleetStats.creditsPerHour >= 0 ? '+' : ''}{$fleetStats.creditsPerHour.toLocaleString()}
+				{:else}
+					---
+				{/if}
 				<span class="text-sm text-chrome-silver">cr/hr</span>
 			</p>
 		</div>
