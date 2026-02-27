@@ -1009,12 +1009,18 @@ async function ensureFactionMembership(botManager: BotManager): Promise<void> {
   const officerRank = officer.player!.factionRank ?? "member";
   console.log(`[Faction] Officer: ${officer.username} (rank: ${officerRank}, faction: ${factionId})`);
 
-  // Check which bots need inviting
-  const needInvite = allBots.filter(
-    (b) => b.player!.factionId !== factionId
-  );
+  // Only target bots with NO faction — don't touch bots already in our or another faction
+  const needInvite = allBots.filter((b) => !b.player!.factionId);
 
-  // Check which bots need promotion (already in faction but not officer/leader)
+  // Bots in a different faction — warn but don't touch
+  const wrongFaction = allBots.filter(
+    (b) => b.player!.factionId && b.player!.factionId !== factionId
+  );
+  if (wrongFaction.length > 0) {
+    console.warn(`[Faction] ${wrongFaction.length} bot(s) in a different faction: ${wrongFaction.map((b) => b.username).join(", ")} — leave their faction manually first`);
+  }
+
+  // Check which bots need promotion (already in OUR faction but not officer/leader)
   const needPromotion = allBots.filter(
     (b) => b.player!.factionId === factionId
       && b.player!.factionRank !== "officer"
@@ -1027,7 +1033,30 @@ async function ensureFactionMembership(botManager: BotManager): Promise<void> {
     return;
   }
 
-  // Step 1: Officer invites non-faction bots
+  // Determine faction home station for docking
+  const factionHome = botManager.fleetConfig.factionStorageStation
+    || botManager.fleetConfig.homeBase
+    || "";
+
+  // Step 1: Navigate non-faction bots to faction home and dock
+  if (needInvite.length > 0 && factionHome) {
+    console.log(`[Faction] Navigating ${needInvite.length} bot(s) to faction home: ${factionHome}`);
+    for (const bot of needInvite) {
+      try {
+        await navigateBotToBase(bot, factionHome);
+      } catch (err) {
+        console.warn(`[Faction] ${bot.username} failed to reach faction home: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+    // Also ensure officer is docked at faction home
+    try {
+      await navigateBotToBase(officer, factionHome);
+    } catch (err) {
+      console.warn(`[Faction] Officer ${officer.username} failed to reach faction home: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  // Step 2: Officer invites non-faction bots
   if (needInvite.length > 0) {
     console.log(`[Faction] Inviting ${needInvite.length} bot(s): ${needInvite.map((b) => b.username).join(", ")}`);
 
@@ -1041,7 +1070,7 @@ async function ensureFactionMembership(botManager: BotManager): Promise<void> {
       }
     }
 
-    // Step 2: Each invited bot checks invites and accepts
+    // Step 3: Each invited bot checks invites and accepts
     for (const bot of needInvite) {
       try {
         const invites = await bot.api!.factionGetInvites();
@@ -1057,26 +1086,15 @@ async function ensureFactionMembership(botManager: BotManager): Promise<void> {
         console.warn(`[Faction] ${bot.username} failed to join: ${err instanceof Error ? err.message : err}`);
       }
     }
-
-    // Refresh player state for newly joined bots
-    for (const bot of needInvite) {
-      try {
-        const status = await bot.api!.getStatus();
-        // Player state is internal — trigger a light refresh
-      } catch {}
-    }
   }
 
-  // Step 3: Promote all non-officer bots (only leader can promote)
-  const toPromote = [...needPromotion, ...needInvite]; // Newly joined + existing non-officers
-  if (toPromote.length > 0 && (officerRank === "leader" || officerRank === "officer")) {
-    // Only the leader can promote — check if officer is the leader
+  // Step 4: Promote all non-officer bots (only leader can promote)
+  if (needPromotion.length > 0) {
     if (officerRank !== "leader") {
       console.log(`[Faction] Officer ${officer.username} is ${officerRank}, not leader — cannot promote bots. Promote them manually.`);
     } else {
-      console.log(`[Faction] Promoting ${toPromote.length} bot(s) to officer`);
-      for (const bot of toPromote) {
-        if (bot === officer) continue; // Don't promote self
+      console.log(`[Faction] Promoting ${needPromotion.length} bot(s) to officer`);
+      for (const bot of needPromotion) {
         try {
           await officer.api!.factionPromote(bot.username, "officer");
           console.log(`[Faction] Promoted ${bot.username} to officer`);
@@ -1089,6 +1107,39 @@ async function ensureFactionMembership(botManager: BotManager): Promise<void> {
   }
 
   console.log("[Faction] Membership check complete");
+}
+
+/** Navigate a bot to a target base — undock if needed, travel, dock. Used for faction enrollment. */
+async function navigateBotToBase(bot: import("./bot/bot").Bot, baseId: string): Promise<void> {
+  const api = bot.api!;
+  const player = bot.player!;
+
+  // Already docked at the target
+  if (player.dockedAtBase === baseId) return;
+
+  // Undock if docked elsewhere
+  if (player.dockedAtBase) {
+    await api.undock();
+    await sleep(11_000);
+  }
+
+  // Try to travel to the base POI (base ID often matches or is derived from POI)
+  // Use find_route to get there if in a different system
+  try {
+    await api.travel(baseId);
+    await sleep(11_000);
+  } catch {
+    // travel() might fail if baseId is not a POI — try dock directly
+  }
+
+  // Dock
+  try {
+    await api.dock();
+    await sleep(11_000);
+    console.log(`[Faction] ${bot.username} docked at ${baseId}`);
+  } catch (err) {
+    console.warn(`[Faction] ${bot.username} dock failed: ${err instanceof Error ? err.message : err}`);
+  }
 }
 
 // v2: invalidates old cached values from broken discovery that tagged the wrong station
