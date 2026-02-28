@@ -13,9 +13,11 @@ import type { Crafting } from "../core/crafting";
 import type { ApiClient } from "../core/api-client";
 import type { GameCache } from "../data/game-cache";
 import type { FleetStatus } from "../bot/types";
-import type { CommanderBrain, EvaluationOutput, Assignment, WorldContext } from "./types";
+import type { ShipClass } from "../types/game";
+import type { CommanderBrain, EvaluationOutput, Assignment, WorldContext, PendingUpgrade } from "./types";
 import { EconomyEngine } from "./economy-engine";
 import { ScoringBrain, type ScoringConfig } from "./scoring-brain";
+import { findBestUpgrade, calculateROI } from "../core/ship-fitness";
 
 export interface CommanderConfig {
   /** Evaluation interval in seconds */
@@ -56,6 +58,7 @@ export class Commander {
   private tick = 0;
   private decisionHistory: CommanderDecision[] = [];
   private maxHistorySize = 100;
+  private lastShipCheck = 0;
 
   constructor(
     private config: CommanderConfig,
@@ -158,6 +161,15 @@ export class Commander {
     this.brain = brain;
   }
 
+  /** Set ship catalog for upgrade evaluation (call after loading from cache/API) */
+  setShipCatalog(catalog: ShipClass[]): void {
+    const brain = this.brain as ScoringBrain;
+    if (brain.shipCatalog !== undefined) {
+      brain.shipCatalog = catalog;
+      console.log(`[Commander] Ship catalog loaded: ${catalog.length} ship classes`);
+    }
+  }
+
   /** Get recent decision history */
   getDecisionHistory(): CommanderDecision[] {
     return [...this.decisionHistory];
@@ -180,6 +192,9 @@ export class Commander {
 
     // Step 1.5: Poll faction storage (non-blocking, best-effort)
     await this.pollFactionStorage();
+
+    // Step 1.6: Check for ship upgrades (every 5 minutes)
+    await this.checkShipUpgrades(fleet);
 
     // Step 2: Analyze economy
     const economySnapshot = this.economy.analyze(fleet);
@@ -265,6 +280,59 @@ export class Commander {
       this.economy.updateFactionInventory(inventory);
     } catch {
       // Non-critical - faction storage may not be accessible
+    }
+  }
+
+  /** Periodically evaluate fleet for ship upgrades (every 5 minutes) */
+  private async checkShipUpgrades(fleet: FleetStatus): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastShipCheck < 300_000) return; // Only check every 5 minutes
+    this.lastShipCheck = now;
+
+    // Only works with ScoringBrain (has pendingUpgrades + shipCatalog)
+    const brain = this.brain as ScoringBrain;
+    if (!brain.shipCatalog || brain.shipCatalog.length === 0) return;
+
+    const catalog = brain.shipCatalog;
+    const minReserve = Math.max(5000, this.deps.minBotCredits ?? 0);
+
+    // Clear stale pending upgrades for bots that already completed upgrading
+    for (const [botId, pending] of brain.pendingUpgrades) {
+      const bot = fleet.bots.find((b) => b.botId === botId);
+      if (!bot) {
+        brain.pendingUpgrades.delete(botId);
+        continue;
+      }
+      // If bot already has the target ship, remove the pending upgrade
+      if (bot.shipClass === pending.targetShipClass) {
+        brain.pendingUpgrades.delete(botId);
+      }
+    }
+
+    for (const bot of fleet.bots) {
+      if (bot.status !== "ready" && bot.status !== "running") continue;
+      if (bot.routine === "ship_upgrade") continue; // Already upgrading
+      if (brain.pendingUpgrades.has(bot.botId)) continue; // Already queued
+
+      const role = bot.routine ?? "default";
+      const currentClass = catalog.find((s) => s.id === bot.shipClass);
+      if (!currentClass) continue;
+
+      const budget = bot.credits - minReserve;
+      if (budget <= 0) continue;
+
+      const upgrade = findBestUpgrade(currentClass.id, role, catalog, budget);
+      if (!upgrade) continue;
+
+      const roi = calculateROI(currentClass, upgrade, role);
+      brain.pendingUpgrades.set(bot.botId, {
+        targetShipClass: upgrade.id,
+        targetPrice: upgrade.basePrice,
+        role,
+        roi,
+      });
+
+      console.log(`[Commander] Ship upgrade queued: ${bot.botId} ${currentClass.id} → ${upgrade.id} (role=${role}, price=${upgrade.basePrice}cr, ROI=${roi.toFixed(2)})`);
     }
   }
 

@@ -107,6 +107,7 @@
 						<tr class="text-left text-xs text-chrome-silver uppercase tracking-wider border-b border-hull-grey/30">
 							<th class="pb-2 pr-4">Status</th>
 							<th class="pb-2 pr-4">Bot</th>
+							<th class="pb-2 pr-4">Ship</th>
 							<th class="pb-2 pr-4">Routine</th>
 							<th class="pb-2 pr-4">State</th>
 							<th class="pb-2 pr-4">Location</th>
@@ -132,6 +133,9 @@
 									<a href="/bots/{bot.id}" class="text-star-white hover:text-plasma-cyan font-medium">
 										{bot.username}
 									</a>
+								</td>
+								<td class="py-2 pr-4 text-chrome-silver text-xs">
+									{bot.shipName ?? bot.shipClass ?? "--"}
 								</td>
 								<td class="py-2 pr-4">
 									{#if bot.routine}
@@ -161,12 +165,14 @@
 									{bot.creditsPerHour >= 0 ? "+" : ""}{bot.creditsPerHour.toLocaleString()}
 								</td>
 								<td class="py-2 pr-4 text-right mono">
-									<span class={bot.fuelPct < 20 ? "text-claw-red" : bot.fuelPct < 50 ? "text-warning-yellow" : "text-chrome-silver"}>
+									<span class={bot.fuelPct < 20 ? "text-claw-red" : bot.fuelPct < 50 ? "text-warning-yellow" : "text-star-white"}>
 										{Math.round(bot.fuelPct)}%
 									</span>
+									<span class="text-hull-grey text-[10px] ml-0.5">{Math.round(bot.fuel)}/{Math.round(bot.maxFuel)}</span>
 								</td>
-								<td class="py-2 text-right mono text-chrome-silver">
-									{Math.round(bot.cargoPct)}%
+								<td class="py-2 text-right mono">
+									<span class="text-star-white">{Math.round(bot.cargoPct)}%</span>
+									<span class="text-hull-grey text-[10px] ml-0.5">{Math.round(bot.cargoUsed)}/{Math.round(bot.cargoCapacity)}</span>
 								</td>
 							</tr>
 						{/each}

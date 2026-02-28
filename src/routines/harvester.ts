@@ -31,6 +31,98 @@ export async function* harvester(ctx: BotContext): AsyncGenerator<string, void, 
   let rawTargets = getParam<HarvestTarget[]>(ctx, "targets", []);
   let depositStation = getParam(ctx, "depositStation", "");
   const resourceType = getParam(ctx, "resourceType", "ore");
+  const depositToStorage = getParam(ctx, "depositToStorage", false);
+  const equipModules = getParam<string[]>(ctx, "equipModules", []);
+  const unequipModules = getParam<string[]>(ctx, "unequipModules", []);
+
+  // ── Equip/unequip modules if commanded by scoring brain ──
+  if ((equipModules.length > 0 || unequipModules.length > 0) && ctx.player.dockedAtBase) {
+    for (const modId of unequipModules) {
+      if (ctx.shouldStop) return;
+      try {
+        await ctx.api.uninstallMod(modId);
+        await ctx.refreshState();
+        yield `unequipped ${modId}`;
+      } catch (err) {
+        yield `unequip ${modId} failed: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
+    for (const modPattern of equipModules) {
+      if (ctx.shouldStop) return;
+      if (ctx.ship.modules.some((m) => m.moduleId.includes(modPattern))) continue;
+      const inCargo = ctx.ship.cargo.find((c) => c.itemId.includes(modPattern));
+      if (inCargo) {
+        try {
+          await ctx.api.installMod(inCargo.itemId);
+          await ctx.refreshState();
+          yield `equipped ${inCargo.itemId} from cargo`;
+          continue;
+        } catch (err) {
+          yield `equip ${inCargo.itemId} failed: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      }
+      try {
+        const storage = await ctx.api.viewFactionStorage();
+        const mod = (storage ?? []).find((s) => s.itemId.includes(modPattern) && s.quantity > 0);
+        if (mod) {
+          await ctx.api.factionWithdrawItems(mod.itemId, 1);
+          await ctx.refreshState();
+          yield `withdrew ${mod.itemId} from faction storage`;
+          try {
+            await ctx.api.installMod(mod.itemId);
+            await ctx.refreshState();
+            yield `equipped ${mod.itemId}`;
+          } catch (err) {
+            yield `equip ${mod.itemId} failed: ${err instanceof Error ? err.message : String(err)}`;
+            try {
+              await ctx.api.factionDepositItems(mod.itemId, 1);
+              await ctx.refreshState();
+            } catch { /* best effort */ }
+          }
+        }
+      } catch (err) {
+        yield `module withdraw failed: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
+  } else if ((equipModules.length > 0 || unequipModules.length > 0) && !ctx.player.dockedAtBase) {
+    // Need to dock first to equip/unequip modules
+    try {
+      await findAndDock(ctx);
+      for (const modId of unequipModules) {
+        if (ctx.shouldStop) return;
+        try {
+          await ctx.api.uninstallMod(modId);
+          await ctx.refreshState();
+          yield `unequipped ${modId}`;
+        } catch (err) {
+          yield `unequip ${modId} failed: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      }
+      for (const modPattern of equipModules) {
+        if (ctx.shouldStop) return;
+        if (ctx.ship.modules.some((m) => m.moduleId.includes(modPattern))) continue;
+        try {
+          const storage = await ctx.api.viewFactionStorage();
+          const mod = (storage ?? []).find((s) => s.itemId.includes(modPattern) && s.quantity > 0);
+          if (mod) {
+            await ctx.api.factionWithdrawItems(mod.itemId, 1);
+            await ctx.refreshState();
+            await ctx.api.installMod(mod.itemId);
+            await ctx.refreshState();
+            yield `equipped ${mod.itemId}`;
+          }
+        } catch (err) {
+          yield `equip failed: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      }
+      if (ctx.player.dockedAtBase) {
+        await ctx.api.undock();
+        await ctx.refreshState();
+      }
+    } catch {
+      yield "could not dock for module equip — continuing without";
+    }
+  }
 
   // Auto-discover targets if empty
   if (rawTargets.length === 0) {
@@ -135,11 +227,11 @@ export async function* harvester(ctx: BotContext): AsyncGenerator<string, void, 
     if (ctx.shouldStop) return;
 
     // ── Deposit at station ──
-    // Use faction storage station if configured
+    const mode = depositToStorage
+      ? "faction_deposit"
+      : ctx.settings.storageMode;
     const factionStation = ctx.fleetConfig.factionStorageStation;
-    const isFactionMode = ctx.settings.storageMode === "faction_deposit"
-      || ctx.fleetConfig.defaultStorageMode === "faction_deposit";
-    const targetStation = (isFactionMode && factionStation)
+    const targetStation = (mode === "faction_deposit" && factionStation)
       ? factionStation
       : depositStation;
 
@@ -163,12 +255,18 @@ export async function* harvester(ctx: BotContext): AsyncGenerator<string, void, 
     if (ctx.shouldStop) return;
 
     // Deposit all cargo
-    yield "depositing materials";
+    const depositMode = mode === "faction_deposit" ? "faction" : "personal";
+    yield `depositing materials (${depositMode} storage)`;
     for (const item of ctx.ship.cargo) {
       if (ctx.shouldStop) return;
       if (isProtectedItem(item.itemId)) continue;
       try {
-        await depositItem(ctx, item.itemId);
+        if (mode === "faction_deposit") {
+          await ctx.api.factionDepositItems(item.itemId, item.quantity);
+        } else {
+          await depositItem(ctx, item.itemId);
+        }
+        await ctx.refreshState();
         yield `deposited ${item.quantity} ${item.itemId}`;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

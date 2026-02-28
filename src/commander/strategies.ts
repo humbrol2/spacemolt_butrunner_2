@@ -19,6 +19,7 @@ const DEFAULT_WEIGHTS: StrategyWeights = {
   return_home: 0.1,
   scout: 0.1,
   quartermaster: 0.8,
+  ship_upgrade: 1.0,
 };
 
 /** Goal-specific weight overrides */

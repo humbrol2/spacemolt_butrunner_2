@@ -176,7 +176,11 @@ export class Bot {
       poiName,
       credits: this._player?.credits ?? 0,
       creditsPerHour: 0,
+      fuel: this._ship?.fuel ?? 0,
+      maxFuel: this._ship?.maxFuel ?? 0,
       fuelPct: this._ship ? (this._ship.maxFuel > 0 ? (this._ship.fuel / this._ship.maxFuel) * 100 : 0) : 0,
+      cargoUsed: this._ship?.cargoUsed ?? 0,
+      cargoCapacity: this._ship?.cargoCapacity ?? 0,
       cargoPct: this._ship ? (this._ship.cargoCapacity > 0 ? (this._ship.cargoUsed / this._ship.cargoCapacity) * 100 : 0) : 0,
       hullPct: this._ship ? (this._ship.maxHull > 0 ? (this._ship.hull / this._ship.maxHull) * 100 : 0) : 0,
       shieldPct: this._ship ? (this._ship.maxShield > 0 ? (this._ship.shield / this._ship.maxShield) * 100 : 0) : 0,
@@ -425,9 +429,6 @@ export class Bot {
     console.log(`[${this.id}] disposing ${disposable.length} leftover cargo item(s) before new routine`);
     this.onStateChange?.(this.id, this._routine ?? "bot", "disposing leftover cargo");
 
-    const useFactionDeposit = this.fleetConfig.defaultStorageMode === "faction_deposit"
-      || this.settings.storageMode === "faction_deposit";
-
     for (const item of disposable) {
       // Try sell first (earns credits)
       try {
@@ -439,15 +440,13 @@ export class Bot {
         }
       } catch { /* sell failed, try deposit */ }
 
-      // Sell didn't work (no demand) — try faction deposit if configured
-      if (useFactionDeposit) {
-        try {
-          await ctx.api.factionDepositItems(item.itemId, item.quantity);
-          console.log(`[${this.id}] deposited ${item.quantity} ${item.itemId} to faction storage`);
-          await ctx.refreshState();
-          continue;
-        } catch { /* faction deposit failed too */ }
-      }
+      // Sell didn't work — always try faction deposit (crafted goods belong in supply chain)
+      try {
+        await ctx.api.factionDepositItems(item.itemId, item.quantity);
+        console.log(`[${this.id}] deposited ${item.quantity} ${item.itemId} to faction storage`);
+        await ctx.refreshState();
+        continue;
+      } catch { /* faction deposit failed too */ }
 
       // Last resort: deposit to station storage (never jettison)
       try {
@@ -455,7 +454,7 @@ export class Bot {
         console.log(`[${this.id}] stashed ${item.quantity} ${item.itemId} in station storage`);
         await ctx.refreshState();
       } catch {
-        // Item stays in cargo — nothing we can do without leaving station
+        console.warn(`[${this.id}] could not dispose ${item.quantity} ${item.itemId} (sell+deposit failed)`);
       }
     }
   }

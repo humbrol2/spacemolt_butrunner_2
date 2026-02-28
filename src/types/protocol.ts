@@ -17,7 +17,8 @@ export type RoutineName =
   | "mission_runner"
   | "return_home"
   | "scout"
-  | "quartermaster";
+  | "quartermaster"
+  | "ship_upgrade";
 
 export const ROUTINE_COLORS: Record<RoutineName, string> = {
   miner: "#ff6b35",
@@ -31,6 +32,7 @@ export const ROUTINE_COLORS: Record<RoutineName, string> = {
   return_home: "#8899aa",
   scout: "#66ccff",
   quartermaster: "#c9a84c",
+  ship_upgrade: "#4ecdc4",
 };
 
 export type BotStatus = "idle" | "logging_in" | "ready" | "running" | "stopping" | "error";
@@ -50,7 +52,11 @@ export interface BotSummary {
   poiName: string | null;
   credits: number;
   creditsPerHour: number;
+  fuel: number;
+  maxFuel: number;
   fuelPct: number;
+  cargoUsed: number;
+  cargoCapacity: number;
   cargoPct: number;
   hullPct: number;
   shieldPct: number;

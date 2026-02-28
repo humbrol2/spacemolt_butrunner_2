@@ -103,7 +103,7 @@
 						</div>
 						<div class="flex justify-between">
 							<span class="text-chrome-silver">Ship</span>
-							<span class="text-star-white">{bot.shipClass ?? "Unknown"}</span>
+							<span class="text-star-white">{bot.shipName ?? bot.shipClass ?? "Unknown"}</span>
 						</div>
 						<div class="flex justify-between">
 							<span class="text-chrome-silver">Routine</span>
@@ -132,7 +132,7 @@
 										style="width: {bot.fuelPct}%"
 									></div>
 								</div>
-								<span class="text-chrome-silver mono w-8 text-right">{Math.round(bot.fuelPct)}%</span>
+								<span class="text-chrome-silver mono w-16 text-right text-[10px]">{Math.round(bot.fuel)}/{Math.round(bot.maxFuel)} <span class="text-hull-grey">{Math.round(bot.fuelPct)}%</span></span>
 							</div>
 							<div class="flex items-center gap-2 mt-1">
 								<span class="text-chrome-silver w-10">Cargo</span>
@@ -142,7 +142,7 @@
 										style="width: {bot.cargoPct}%"
 									></div>
 								</div>
-								<span class="text-chrome-silver mono w-8 text-right">{Math.round(bot.cargoPct)}%</span>
+								<span class="text-chrome-silver mono w-16 text-right text-[10px]">{Math.round(bot.cargoUsed)}/{Math.round(bot.cargoCapacity)} <span class="text-hull-grey">{Math.round(bot.cargoPct)}%</span></span>
 							</div>
 						</div>
 					</div>

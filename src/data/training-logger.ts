@@ -172,6 +172,17 @@ export class TrainingLogger {
     );
   }
 
+  /** Log a ship upgrade decision (reuses commander_log table) */
+  logShipUpgrade(botId: string, fromShip: string, toShip: string, cost: number, role: string): void {
+    this.logCommanderDecision({
+      tick: Math.floor(Date.now() / 1000),
+      goal: "ship_upgrade",
+      fleetState: { botId, fromShip, toShip, cost, role },
+      assignments: [{ botId, routine: "ship_upgrade", fromShip, toShip, cost }],
+      reasoning: `Upgraded ${botId}: ${fromShip} → ${toShip} for ${cost}cr (role: ${role})`,
+    });
+  }
+
   /** Log a financial event (revenue or cost) for the profit chart */
   logFinancialEvent(type: "revenue" | "cost", amount: number, botId?: string): void {
     if (amount <= 0) return;

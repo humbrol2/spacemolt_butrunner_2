@@ -15,6 +15,7 @@ import { mission_runner } from "./mission_runner";
 import { returnHome } from "./return_home";
 import { scout } from "./scout";
 import { quartermaster } from "./quartermaster";
+import { ship_upgrade } from "./ship_upgrade";
 
 export { miner } from "./miner";
 export { harvester } from "./harvester";
@@ -27,8 +28,9 @@ export { mission_runner } from "./mission_runner";
 export { returnHome } from "./return_home";
 export { scout } from "./scout";
 export { quartermaster } from "./quartermaster";
+export { ship_upgrade } from "./ship_upgrade";
 
-/** Build the complete routine registry with all 11 routines. */
+/** Build the complete routine registry with all 12 routines. */
 export function buildRoutineRegistry(): RoutineRegistry {
   return {
     miner,
@@ -42,5 +44,6 @@ export function buildRoutineRegistry(): RoutineRegistry {
     return_home: returnHome,
     scout,
     quartermaster,
+    ship_upgrade,
   };
 }

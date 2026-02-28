@@ -27,9 +27,9 @@ import {
 
 // Equipment modules to accumulate for fleet use
 const MODULE_TARGETS = [
-  { pattern: "ice_harvester", target: 4, label: "Ice Harvester" },
-  { pattern: "gas_harvester", target: 4, label: "Gas Harvester" },
-  { pattern: "survey", target: 3, label: "Survey Scanner" },
+  { pattern: "ice_harvester", target: 4, label: "Ice Harvester", fallbackIds: ["module_ice_harvester_1", "ice_harvester_1"], fallbackPrice: 15000 },
+  { pattern: "gas_harvester", target: 4, label: "Gas Harvester", fallbackIds: ["module_gas_harvester_1", "gas_harvester_1"], fallbackPrice: 15000 },
+  { pattern: "survey", target: 3, label: "Survey Scanner", fallbackIds: ["module_survey_scanner_1", "survey_scanner_1"], fallbackPrice: 20000 },
 ];
 
 // Items that look like ship modules (don't sell these from faction storage)
@@ -411,8 +411,8 @@ async function* buyEquipmentModules(
       // Need exact item ID from catalog (pattern alone isn't a valid item ID)
       const catalogItems = ctx.crafting.findItemsByPattern(target.pattern);
       const exactItem = catalogItems.length > 0 ? catalogItems[0] : null;
-      const exactId = exactItem?.id ?? target.pattern;
-      const basePrice = exactItem?.basePrice ?? ctx.crafting.getItemBasePrice(target.pattern);
+      const exactId = exactItem?.id ?? target.fallbackIds?.[0] ?? target.pattern;
+      const basePrice = exactItem?.basePrice ?? target.fallbackPrice ?? ctx.crafting.getItemBasePrice(target.pattern);
       const offerPrice = basePrice > 0 ? Math.ceil(basePrice * 1.1) : 0; // 10% above base to attract
       if (offerPrice > 0 && offerPrice <= budget) {
         try {

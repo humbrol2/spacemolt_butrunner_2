@@ -572,6 +572,19 @@ async function main() {
       if (botManager.fleetConfig.homeSystem && !brain.homeSystem) {
         brain.homeSystem = botManager.fleetConfig.homeSystem;
       }
+
+      // Load ship catalog for upgrade evaluation
+      try {
+        const anyBot = botManager.getAllBots().find((b) => b.api && (b.status === "ready" || b.status === "running"));
+        if (anyBot?.api) {
+          const shipCatalog = await gameCache.getShipCatalog(anyBot.api);
+          if (shipCatalog.length > 0) {
+            commander.setShipCatalog(shipCatalog);
+          }
+        }
+      } catch (err) {
+        console.warn("[Fleet] Failed to load ship catalog:", err instanceof Error ? err.message : err);
+      }
     }
     for (const fail of result.failed) {
       console.warn(`[Fleet] Login failed for ${fail.username}: ${fail.error}`);
@@ -1081,6 +1094,9 @@ async function buildFactionState(
  * usually docked at their last position. If not, commands will fail gracefully.
  * Mutations are rate-limited (1 per 10s per bot), so we add delays.
  */
+/** Tracks bots we've already attempted to promote (shared between startup + periodic) */
+const _promotedBots = new Set<string>();
+
 async function ensureFactionMembership(botManager: BotManager): Promise<void> {
   const allBots = botManager.getAllBots().filter(
     (b) => b.player && b.api && (b.status === "ready" || b.status === "running")
@@ -1187,9 +1203,11 @@ async function ensureFactionMembership(botManager: BotManager): Promise<void> {
       for (const bot of needPromotion) {
         try {
           await officer.api!.factionPromote(bot.username, "officer");
+          _promotedBots.add(bot.id);
           console.log(`[Faction] Promoted ${bot.username} to officer`);
           await sleep(11_000); // Rate limit
         } catch (err) {
+          _promotedBots.add(bot.id); // Don't retry on failure either
           console.warn(`[Faction] Failed to promote ${bot.username}: ${err instanceof Error ? err.message : err}`);
         }
       }
@@ -1204,8 +1222,6 @@ async function ensureFactionMembership(botManager: BotManager): Promise<void> {
  * promote any faction members that aren't yet officers.
  * Tracks already-promoted bots to avoid re-attempting every cycle.
  */
-const _promotedBots = new Set<string>();
-
 async function promoteFactionMembers(botManager: BotManager): Promise<void> {
   const factionHome = botManager.fleetConfig.factionStorageStation || botManager.fleetConfig.homeBase;
   if (!factionHome) return;

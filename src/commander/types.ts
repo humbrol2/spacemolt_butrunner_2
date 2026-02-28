@@ -142,6 +142,14 @@ export interface BotScore {
   reasoning: string;
 }
 
+/** Pending ship upgrade queued by Commander for a bot */
+export interface PendingUpgrade {
+  targetShipClass: string;
+  targetPrice: number;
+  role: string;
+  roi: number;
+}
+
 /** Goal-type weight profiles for routine scoring */
 export interface StrategyWeights {
   miner: number;
@@ -155,6 +163,7 @@ export interface StrategyWeights {
   return_home: number;
   scout: number;
   quartermaster: number;
+  ship_upgrade: number;
 }
 
 // ── Reassignment Tracking ──

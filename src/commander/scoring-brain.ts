@@ -19,11 +19,15 @@ import type {
   ReassignmentState,
 } from "./types";
 import type { TradeRoute } from "../core/market";
+import type { PendingUpgrade } from "./types";
+import type { ShipClass } from "../types/game";
+import { scoreShipForRole } from "../core/ship-fitness";
 import { getStrategyWeights } from "./strategies";
 
 const ALL_ROUTINES: RoutineName[] = [
   "miner", "harvester", "trader", "explorer", "crafter",
   "hunter", "salvager", "return_home", "scout", "quartermaster",
+  "ship_upgrade",
   // "mission_runner", // Disabled until mission system is tested
 ];
 
@@ -36,6 +40,7 @@ const ROUTINE_MAX_COUNT: Partial<Record<RoutineName, number>> = {
   scout: 1,
   explorer: 1, // Default; overridden by getMaxCount() for larger fleets
   quartermaster: 1, // Only one faction home manager
+  ship_upgrade: 1, // One upgrade at a time fleet-wide
 };
 
 /** Dynamic max count: scales explorer cap with fleet size */
@@ -80,6 +85,7 @@ const DEFAULT_CONFIG: ScoringConfig = {
     return_home: 5,     // Utility routine — only for idle bots away from home
     scout: 10,          // One-shot data gathering — scored high only when data is needed
     quartermaster: 35,  // Faction home manager — sells goods, buys modules
+    ship_upgrade: 0,    // Only scores > 0 when Commander queues an upgrade
   },
   supplyMultiplier: 15,
   skillBonus: 10,
@@ -518,9 +524,15 @@ export class ScoringBrain implements CommanderBrain {
   }
 
   private calcSkillBonus(bot: FleetBotInfo, routine: RoutineName): number {
-    // Currently we don't have skill data on FleetBotInfo
-    // This could be expanded when skill tracking is integrated
-    // For now, return 0 - skills will be factored in later phases
+    // Ship fitness bonus: bots in better ships for a role get priority
+    if (bot.shipClass && this.shipCatalog.length > 0) {
+      const shipClass = this.shipCatalog.find((s) => s.id === bot.shipClass);
+      if (shipClass) {
+        const fitness = scoreShipForRole(shipClass, routine);
+        // +0 to +25 bonus based on ship fitness (normalized 0-100 → 0-25)
+        return Math.round(fitness * 0.25);
+      }
+    }
     return 0;
   }
 
@@ -784,6 +796,19 @@ export class ScoringBrain implements CommanderBrain {
         // Bonus: +30 if there are goods to sell, +10 base for fleet management
         return hasSellableGoods ? -30 : -10;
       }
+      case "ship_upgrade": {
+        if (!bot) return 200;
+        const pending = this.pendingUpgrades.get(bot.botId);
+        if (!pending) return 200; // No upgrade queued → block entirely
+        // Hard cap: only 1 ship_upgrade at a time
+        const upgradeCount = fleet?.bots.filter((b) => b.routine === "ship_upgrade").length ?? 0;
+        if (upgradeCount >= 1 && bot.routine !== "ship_upgrade") return 200;
+        // Base 70 when upgrade is queued — high enough to interrupt most activities
+        let bonus = -70;
+        // ROI bonus: better deals score higher (cap -20)
+        bonus -= Math.min(20, pending.roi * 10);
+        return bonus;
+      }
       default:
         return 0;
     }
@@ -837,11 +862,7 @@ export class ScoringBrain implements CommanderBrain {
       case "miner":
         return this.buildMinerParams(bot, economy, existingAssignments, world);
       case "harvester":
-        return {
-          targets: [],
-          depositStation: homeBase,
-          resourceType: "ore",
-        };
+        return this.buildHarvesterParams(bot, economy, existingAssignments, world);
       case "trader":
         return this.buildTraderParams(bot, economy, existingAssignments, world);
       case "explorer":
@@ -860,9 +881,23 @@ export class ScoringBrain implements CommanderBrain {
         return { targetSystem: this.homeSystem, scanMarket: true, checkFaction: true };
       case "quartermaster":
         return { homeBase: this.homeBase };
+      case "ship_upgrade":
+        return this.buildShipUpgradeParams(bot);
       default:
         return {};
     }
+  }
+
+  /** Build ship_upgrade params from the pending upgrades queue */
+  private buildShipUpgradeParams(bot: FleetBotInfo): Record<string, unknown> {
+    const pending = this.pendingUpgrades.get(bot.botId);
+    if (!pending) return { targetShipClass: "", maxSpend: 0, sellOldShip: true };
+    const reserve = Math.max(5000, this.minBotCredits);
+    return {
+      targetShipClass: pending.targetShipClass,
+      maxSpend: Math.max(0, bot.credits - reserve),
+      sellOldShip: true,
+    };
   }
 
   /**
@@ -935,6 +970,10 @@ export class ScoringBrain implements CommanderBrain {
   crafting: import("../core/crafting").Crafting | null = null;
   /** Galaxy service (set by Commander for belt-aware miner params) */
   galaxy: import("../core/galaxy").Galaxy | null = null;
+  /** Pending ship upgrades queued by Commander (botId → upgrade info) */
+  pendingUpgrades = new Map<string, PendingUpgrade>();
+  /** Ship catalog (set by Commander for ship fitness scoring) */
+  shipCatalog: ShipClass[] = [];
 
   /**
    * Build crafter params with intelligent recipe selection:
@@ -1015,13 +1054,25 @@ export class ScoringBrain implements CommanderBrain {
       }
       score += materialScore;
 
-      // Factor 3: Output is an ingredient for higher-tier recipes (supply chain value)
-      const recipesUsingOutput = available.filter((r) =>
+      // Factor 3: Output is an ingredient for ANY recipes (fleet-wide supply chain value)
+      // Check ALL recipes, not just this bot's available ones
+      const allRecipes = crafting.getAllRecipes();
+      const recipesUsingOutput = allRecipes.filter((r) =>
         r.ingredients.some((i) => i.itemId === recipe.outputItem)
       );
       if (recipesUsingOutput.length > 0) {
         score += 15; // Intermediate product that feeds the chain
         reason += " +chain_value";
+        // Extra bonus if the output is actually MISSING from faction storage
+        // (demand-pull: someone needs this but we have none)
+        const outputStock = economy.factionStorage.get(recipe.outputItem) ?? 0;
+        if (outputStock === 0) {
+          score += 40; // Strong bonus — this intermediate is blocking other crafters
+          reason += " +demand_deficit";
+        } else if (outputStock < 10) {
+          score += 20; // Moderate bonus — low stock of needed intermediate
+          reason += " +demand_low";
+        }
       }
 
       // Factor 4: XP rewards for skill progression
@@ -1225,6 +1276,166 @@ export class ScoringBrain implements CommanderBrain {
       return {
         ...baseParams,
         targetBelt: best.poiId,
+        equipModules,
+        unequipModules,
+      };
+    }
+
+    return baseParams;
+  }
+
+  /**
+   * Build harvester params — focuses on ice/gas POIs (specialized extraction).
+   * Harvester adds value over miner by targeting ice_field and gas_cloud with
+   * specialized modules. Falls back to asteroid belts if no ice/gas available.
+   */
+  private buildHarvesterParams(
+    bot: FleetBotInfo,
+    economy: EconomySnapshot,
+    existingAssignments: Assignment[],
+    world?: WorldContext,
+  ): Record<string, unknown> {
+    const homeBase = this.homeBase;
+    const baseParams = {
+      targets: [] as Array<{ poiId: string; priority: number }>,
+      depositStation: homeBase,
+      resourceType: "ore",
+      depositToStorage: true,
+      equipModules: [] as string[],
+      unequipModules: [] as string[],
+    };
+
+    if (!this.galaxy) return baseParams;
+
+    const POI_ORE_MAP: Record<string, string[]> = {
+      ice_field: ["ore_ice"],
+      gas_cloud: ["ore_crystal", "ore_gas"],
+      nebula: ["ore_crystal", "ore_gas"],
+      asteroid_belt: ["ore_iron", "ore_copper", "ore_titanium", "ore_gold", "ore_nickel", "ore_sol"],
+      asteroid: ["ore_iron", "ore_copper", "ore_titanium", "ore_gold", "ore_nickel", "ore_sol"],
+    };
+
+    const POI_EQUIP: Record<string, string> = {
+      ice_field: "ice_harvester",
+      gas_cloud: "gas_harvester",
+      nebula: "gas_harvester",
+    };
+
+    const RESOURCE_TYPE_MAP: Record<string, string> = {
+      ice_field: "ice",
+      gas_cloud: "gas",
+      nebula: "gas",
+      asteroid_belt: "ore",
+      asteroid: "ore",
+    };
+
+    // Rank by lowest faction stock — but prioritize ice/gas over asteroid belts
+    // (harvesters add unique value for specialized extraction)
+    const oreStock: Array<{ poiType: string; stock: number; specialized: boolean }> = [];
+    for (const [poiType, orePatterns] of Object.entries(POI_ORE_MAP)) {
+      const stock = orePatterns.reduce((sum, prefix) => {
+        let total = 0;
+        for (const [itemId, qty] of economy.factionStorage) {
+          if (itemId.startsWith(prefix)) total += qty;
+        }
+        return sum + total;
+      }, 0);
+      oreStock.push({ poiType, stock, specialized: poiType in POI_EQUIP });
+    }
+    // Deduplicate asteroid/asteroid_belt and gas_cloud/nebula
+    const uniqueStock = oreStock.filter((o, i, arr) =>
+      i === arr.findIndex((x) => {
+        const norm = (t: string) => t === "asteroid" ? "asteroid_belt" : t === "nebula" ? "gas_cloud" : t;
+        return norm(x.poiType) === norm(o.poiType);
+      })
+    );
+    // Sort: specialized (ice/gas) first by stock, then asteroid belts by stock
+    uniqueStock.sort((a, b) => {
+      if (a.specialized !== b.specialized) return a.specialized ? -1 : 1;
+      return a.stock - b.stock;
+    });
+
+    // Collect POIs already claimed by miners or harvesters
+    const claimedPois = new Set<string>();
+    for (const a of existingAssignments) {
+      if (a.routine === "miner" && a.params.targetBelt) {
+        claimedPois.add(String(a.params.targetBelt));
+      }
+      if (a.routine === "harvester" && Array.isArray(a.params.targets)) {
+        for (const t of a.params.targets as Array<{ poiId: string }>) {
+          claimedPois.add(t.poiId);
+        }
+      }
+    }
+
+    const botSystem = bot.systemId ?? this.homeSystem;
+    const hasResourcesLeft = (poi: { resources: Array<{ remaining: number }> }) =>
+      poi.resources.length === 0 || poi.resources.some((r) => r.remaining > 0);
+
+    // Find the best POI type to harvest
+    for (const { poiType } of uniqueStock) {
+      const normalizedTypes = poiType === "asteroid_belt"
+        ? ["asteroid_belt", "asteroid"] : poiType === "gas_cloud"
+        ? ["gas_cloud", "nebula"] : [poiType];
+
+      const candidates: Array<{ systemId: string; poiId: string; distance: number }> = [];
+      for (const type of normalizedTypes) {
+        const pois = this.galaxy.findPoisByType(type as import("../types/game").PoiType);
+        for (const { systemId, poi } of pois) {
+          if (claimedPois.has(poi.id)) continue;
+          if (!hasResourcesLeft(poi)) continue;
+          const distance = botSystem ? (systemId === botSystem ? 0 : 1) : 99;
+          candidates.push({ systemId, poiId: poi.id, distance });
+        }
+      }
+
+      if (candidates.length === 0) continue;
+
+      // Check equipment availability
+      const neededModule = POI_EQUIP[poiType];
+      const hasModule = neededModule
+        ? bot.moduleIds.some((id) => id.includes(neededModule))
+        : true;
+      const moduleInStorage = neededModule
+        ? (economy.factionStorage.get(neededModule) ?? 0) > 0
+        : false;
+
+      if (neededModule && !hasModule && !moduleInStorage) continue;
+
+      // Build equip/unequip lists
+      const equipModules: string[] = [];
+      const unequipModules: string[] = [];
+      if (neededModule && !hasModule && moduleInStorage) {
+        equipModules.push(neededModule);
+      }
+      // Unequip wrong harvester type if switching (e.g. ice→gas or gas→asteroid)
+      if (!neededModule) {
+        for (const modId of bot.moduleIds) {
+          if (modId.includes("ice_harvester") || modId.includes("gas_harvester")) {
+            unequipModules.push(modId);
+          }
+        }
+      } else {
+        // Unequip the OTHER harvester type if present
+        const otherHarvester = neededModule === "ice_harvester" ? "gas_harvester" : "ice_harvester";
+        for (const modId of bot.moduleIds) {
+          if (modId.includes(otherHarvester)) {
+            unequipModules.push(modId);
+          }
+        }
+      }
+
+      // Sort by distance, build targets array (harvester can visit multiple POIs)
+      candidates.sort((a, b) => a.distance - b.distance);
+      const targets = candidates.slice(0, 3).map((c, i) => ({
+        poiId: c.poiId,
+        priority: 3 - i,
+      }));
+
+      return {
+        ...baseParams,
+        targets,
+        resourceType: RESOURCE_TYPE_MAP[poiType] ?? "ore",
         equipModules,
         unequipModules,
       };

@@ -5,7 +5,7 @@
 
 import type { CacheHelper } from "./database";
 import type { ApiClient } from "../core/api-client";
-import { normalizeRecipe, normalizeCatalogItem } from "../core/api-client";
+import { normalizeRecipe, normalizeCatalogItem, normalizeShipClass } from "../core/api-client";
 import type { TrainingLogger } from "./training-logger";
 import type { StarSystem, CatalogItem, ShipClass, Skill, Recipe, MarketPrice } from "../types/game";
 
@@ -83,11 +83,44 @@ export class GameCache {
   // ── Catalogs (static, version-gated) ──
 
   async getItemCatalog(api: ApiClient): Promise<CatalogItem[]> {
-    return this.getCatalogNormalized(api, "items", "item_catalog", normalizeCatalogItem);
+    const cacheKey = "item_catalog";
+    const cached = this.cache.getStatic(cacheKey, this.gameVersion);
+    if (cached) {
+      const raw = JSON.parse(cached) as Array<Record<string, unknown>>;
+      if (raw.length >= 50) return raw.map(normalizeCatalogItem);
+      // Stale/incomplete cache — re-fetch
+      console.log(`[Cache] Item catalog only has ${raw.length} items, re-fetching...`);
+    }
+
+    // Fetch all categories — game API may only return a subset without category filter
+    const categories = ["ore", "refined", "component", "module", "artifact", "fuel", "ammo", "equipment"];
+    const allItems: Record<string, unknown>[] = [];
+    const seenIds = new Set<string>();
+
+    // First: fetch without category (gets whatever default returns)
+    const defaultItems = await this.fetchAllCatalogPages(api, "items");
+    for (const item of defaultItems) {
+      const id = String(item.id ?? item.item_id ?? "");
+      if (id && !seenIds.has(id)) { seenIds.add(id); allItems.push(item); }
+    }
+
+    // Then: fetch each category separately to catch anything missed
+    for (const category of categories) {
+      const catItems = await this.fetchAllCatalogPages(api, "items", category);
+      for (const item of catItems) {
+        const id = String(item.id ?? item.item_id ?? "");
+        if (id && !seenIds.has(id)) { seenIds.add(id); allItems.push(item); }
+      }
+    }
+
+    const normalized = allItems.map(normalizeCatalogItem);
+    this.cache.setStatic(cacheKey, JSON.stringify(normalized), this.gameVersion);
+    console.log(`[Cache] Cached ${normalized.length} items (${categories.length} categories searched)`);
+    return normalized;
   }
 
   async getShipCatalog(api: ApiClient): Promise<ShipClass[]> {
-    return this.getCatalog<ShipClass>(api, "ships", "ship_catalog");
+    return this.getCatalogNormalized(api, "ships", "ship_catalog", normalizeShipClass);
   }
 
   async getSkillTree(api: ApiClient): Promise<Skill[]> {
@@ -130,12 +163,12 @@ export class GameCache {
     return normalized;
   }
 
-  private async fetchAllCatalogPages(api: ApiClient, type: string): Promise<Record<string, unknown>[]> {
-    console.log(`[Cache] Fetching ${type} catalog...`);
+  private async fetchAllCatalogPages(api: ApiClient, type: string, category?: string): Promise<Record<string, unknown>[]> {
+    console.log(`[Cache] Fetching ${type} catalog${category ? ` (category: ${category})` : ""}...`);
     const items: Record<string, unknown>[] = [];
     let page = 1;
     while (true) {
-      const batch = await api.catalog(type, { page, pageSize: 50 });
+      const batch = await api.catalog(type, { page, pageSize: 50, category });
       if (batch.length === 0) break;
       items.push(...batch);
       if (batch.length < 50) break;

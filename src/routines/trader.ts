@@ -718,12 +718,12 @@ async function* factionSellLoop(
     }
 
     // ── Withdraw the most valuable item(s) ──
-    const freeWeight = ctx.cargo.freeSpace(ctx.ship);
     let withdrawnItem = "";
     let withdrawnQty = 0;
 
     for (const item of sellable) {
       if (ctx.shouldStop) return;
+      const freeWeight = ctx.cargo.freeSpace(ctx.ship); // Recalculate each iteration
       const itemSize = ctx.cargo.getItemSize(ctx.ship, item.itemId);
       const maxByWeight = Math.floor(freeWeight / Math.max(1, itemSize));
       const withdrawQty = Math.min(item.quantity, maxByWeight);

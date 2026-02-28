@@ -93,6 +93,46 @@ export async function* miner(ctx: BotContext): AsyncGenerator<string, void, void
         yield `module withdraw failed: ${err instanceof Error ? err.message : String(err)}`;
       }
     }
+  } else if ((equipModules.length > 0 || unequipModules.length > 0) && !ctx.player.dockedAtBase) {
+    // Need to dock first to equip/unequip modules
+    try {
+      await findAndDock(ctx);
+      // Unequip first, then equip
+      for (const modId of unequipModules) {
+        if (ctx.shouldStop) return;
+        try {
+          await ctx.api.uninstallMod(modId);
+          await ctx.refreshState();
+          yield `unequipped ${modId}`;
+        } catch (err) {
+          yield `unequip ${modId} failed: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      }
+      for (const modPattern of equipModules) {
+        if (ctx.shouldStop) return;
+        if (ctx.ship.modules.some((m) => m.moduleId.includes(modPattern))) continue;
+        try {
+          const storage = await ctx.api.viewFactionStorage();
+          const mod = (storage ?? []).find((s) => s.itemId.includes(modPattern) && s.quantity > 0);
+          if (mod) {
+            await ctx.api.factionWithdrawItems(mod.itemId, 1);
+            await ctx.refreshState();
+            await ctx.api.installMod(mod.itemId);
+            await ctx.refreshState();
+            yield `equipped ${mod.itemId}`;
+          }
+        } catch (err) {
+          yield `equip failed: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      }
+      // Undock after equipping
+      if (ctx.player.dockedAtBase) {
+        await ctx.api.undock();
+        await ctx.refreshState();
+      }
+    } catch {
+      yield "could not dock for module equip — continuing without";
+    }
   }
 
   // Auto-discover targets if not provided

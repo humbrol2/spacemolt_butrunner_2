@@ -430,6 +430,23 @@ export class ApiClient {
     return data.ships ?? (Array.isArray(data) ? data : []);
   }
 
+  /** List ships available at the current station's shipyard (query, no rate limit) */
+  async shipyardShowroom(): Promise<Array<Record<string, unknown>>> {
+    const data = await this.query<{ ships?: Array<Record<string, unknown>> }>("shipyard_showroom");
+    return data.ships ?? (Array.isArray(data) ? data : []);
+  }
+
+  /** Sell a ship the bot owns (must not be the active ship) */
+  async sellShip(shipId: string): Promise<Record<string, unknown>> {
+    return this.mutation("sell_ship", { ship_id: shipId });
+  }
+
+  /** Browse player-listed ships on the marketplace (query, no rate limit) */
+  async browseShips(): Promise<Array<Record<string, unknown>>> {
+    const data = await this.query<{ ships?: Array<Record<string, unknown>> }>("browse_ships");
+    return data.ships ?? (Array.isArray(data) ? data : []);
+  }
+
   async searchSystems(queryStr: string): Promise<Array<Record<string, unknown>>> {
     const data = await this.query<{ systems?: Array<Record<string, unknown>> }>("search_systems", { query: queryStr });
     return data.systems ?? (Array.isArray(data) ? data : []);
@@ -1135,4 +1152,23 @@ function str(v: unknown): string {
 
 function num(v: unknown): number {
   return Number(v ?? 0) || 0;
+}
+
+/** Normalize raw ship catalog API response → ShipClass */
+export function normalizeShipClass(raw: Record<string, unknown>): import("../types/game").ShipClass {
+  return {
+    id: str(raw.id),
+    name: str(raw.name),
+    category: str(raw.category),
+    description: str(raw.description),
+    basePrice: num(raw.price ?? raw.base_price ?? raw.basePrice),
+    hull: num(raw.base_hull ?? raw.hull),
+    shield: num(raw.base_shield ?? raw.shield),
+    armor: num(raw.base_armor ?? raw.armor),
+    speed: num(raw.base_speed ?? raw.speed),
+    fuel: num(raw.base_fuel ?? raw.fuel),
+    cargoCapacity: num(raw.cargo_capacity ?? raw.cargoCapacity),
+    cpuCapacity: num(raw.cpu_capacity ?? raw.cpuCapacity),
+    powerCapacity: num(raw.power_capacity ?? raw.powerCapacity),
+  };
 }
