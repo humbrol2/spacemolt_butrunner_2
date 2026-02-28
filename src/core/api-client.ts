@@ -332,9 +332,12 @@ export class ApiClient {
     type: string,
     opts?: { category?: string; id?: string; page?: number; pageSize?: number; search?: string }
   ): Promise<Record<string, unknown>[]> {
+    // API uses snake_case: page_size, not pageSize
+    const { pageSize, ...rest } = opts ?? {};
     const data = await this.query<{ items?: Array<Record<string, unknown>> }>("catalog", {
       type,
-      ...opts,
+      ...rest,
+      ...(pageSize ? { page_size: pageSize } : {}),
     });
     return data.items ?? (Array.isArray(data) ? data : []);
   }
@@ -1123,12 +1126,19 @@ export function normalizeRecipe(raw: Record<string, unknown>): Recipe {
     }
   }
 
+  // Output: API uses outputs array [{item_id, quantity, quality_mod}], fallback to flat fields
+  const rawOutputs = raw.outputs as Array<Record<string, unknown>> | undefined;
+  const outputItem = rawOutputs?.[0]?.item_id
+    ?? raw.output_item ?? raw.outputItem ?? raw.output ?? "";
+  const outputQuantity = rawOutputs?.[0]?.quantity
+    ?? raw.output_quantity ?? raw.outputQuantity ?? 1;
+
   return {
     id: str(raw.id ?? raw.recipe_id),
     name: str(raw.name),
     description: str(raw.description),
-    outputItem: str(raw.output_item ?? raw.outputItem ?? raw.output),
-    outputQuantity: num(raw.output_quantity ?? raw.outputQuantity ?? 1) || 1,
+    outputItem: str(outputItem),
+    outputQuantity: num(outputQuantity) || 1,
     ingredients,
     requiredSkills,
     xpRewards,

@@ -78,6 +78,8 @@ export interface FleetBotInfo {
   moduleIds: string[];
   /** Ship class ID (e.g. "shuttle", "hauler") */
   shipClass: string | null;
+  /** All ships this bot owns: [{id, classId}] — populated after login */
+  ownedShips: Array<{ id: string; classId: string }>;
   /** Bot skill levels (e.g. { mining: 3, trading: 1 }) */
   skills: Record<string, number>;
   /** Routines that completed too quickly (< 60s), mapped to timestamp of failure */

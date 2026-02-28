@@ -60,6 +60,8 @@ export class Bot {
 
   /** Full skill data (fetched via getSkills after login) */
   private _skills: Record<string, { level: number; xp: number; xpNext: number }> = {};
+  /** All ships this bot owns (populated after login) */
+  private _ownedShips: Array<{ id: string; classId: string }> = [];
 
   private deps: BotDeps | null = null;
 
@@ -120,6 +122,9 @@ export class Bot {
   }
   get rapidRoutines(): Map<RoutineName, number> {
     return this._rapidRoutines;
+  }
+  get ownedShips(): Array<{ id: string; classId: string }> {
+    return this._ownedShips;
   }
   /** Record a faction treasury withdrawal (not real revenue) */
   recordFactionWithdrawal(amount: number): void {
@@ -264,6 +269,20 @@ export class Bot {
         this._skills = await this.deps.api.getSkills();
       } catch {
         // Skills from login PlayerState will be used as fallback
+      }
+
+      // Fetch owned ships (non-blocking, best-effort)
+      try {
+        const ships = await this.deps.api.listShips();
+        this._ownedShips = ships.map((s) => ({
+          id: String(s.id ?? ""),
+          classId: String(s.class_id ?? s.classId ?? s.ship_class ?? ""),
+        })).filter((s) => s.id && s.classId);
+        if (this._ownedShips.length > 1) {
+          console.log(`[Bot:${this.username}] Owns ${this._ownedShips.length} ships: ${this._ownedShips.map((s) => s.classId).join(", ")}`);
+        }
+      } catch {
+        // listShips failed — will only track current ship
       }
 
       console.log(`[Bot:${this.username}] Logged in at ${result.player.currentSystem}`);

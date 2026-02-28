@@ -895,8 +895,10 @@ export class ScoringBrain implements CommanderBrain {
     const reserve = Math.max(5000, this.minBotCredits);
     return {
       targetShipClass: pending.targetShipClass,
-      maxSpend: Math.max(0, bot.credits - reserve),
-      sellOldShip: true,
+      maxSpend: pending.alreadyOwned ? 0 : Math.max(0, bot.credits - reserve),
+      sellOldShip: !pending.alreadyOwned, // Don't sell when switching to an already-owned ship
+      alreadyOwned: pending.alreadyOwned ?? false,
+      ownedShipId: pending.ownedShipId ?? "",
     };
   }
 

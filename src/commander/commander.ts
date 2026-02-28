@@ -17,7 +17,7 @@ import type { ShipClass } from "../types/game";
 import type { CommanderBrain, EvaluationOutput, Assignment, WorldContext, PendingUpgrade } from "./types";
 import { EconomyEngine } from "./economy-engine";
 import { ScoringBrain, type ScoringConfig } from "./scoring-brain";
-import { findBestUpgrade, calculateROI } from "../core/ship-fitness";
+import { findBestUpgrade, calculateROI, scoreShipForRole } from "../core/ship-fitness";
 
 export interface CommanderConfig {
   /** Evaluation interval in seconds */
@@ -59,6 +59,8 @@ export class Commander {
   private decisionHistory: CommanderDecision[] = [];
   private maxHistorySize = 100;
   private lastShipCheck = 0;
+  /** Ship classes that failed to be found at any shipyard — blacklisted with cooldown */
+  private shipBlacklist = new Map<string, number>(); // classId → blacklisted until timestamp
 
   constructor(
     private config: CommanderConfig,
@@ -296,7 +298,12 @@ export class Commander {
     const catalog = brain.shipCatalog;
     const minReserve = Math.max(5000, this.deps.minBotCredits ?? 0);
 
-    // Clear stale pending upgrades for bots that already completed upgrading
+    // Expire old blacklist entries (30 minute cooldown)
+    for (const [classId, until] of this.shipBlacklist) {
+      if (now > until) this.shipBlacklist.delete(classId);
+    }
+
+    // Clear stale pending upgrades for bots that already completed or failed upgrading
     for (const [botId, pending] of brain.pendingUpgrades) {
       const bot = fleet.bots.find((b) => b.botId === botId);
       if (!bot) {
@@ -306,6 +313,18 @@ export class Commander {
       // If bot already has the target ship, remove the pending upgrade
       if (bot.shipClass === pending.targetShipClass) {
         brain.pendingUpgrades.delete(botId);
+        continue;
+      }
+      // If bot rapid-completed ship_upgrade, the target wasn't available — blacklist it
+      if (bot.routine !== "ship_upgrade" && bot.rapidRoutines.has("ship_upgrade") && !pending.alreadyOwned) {
+        const rapidTime = bot.rapidRoutines.get("ship_upgrade")!;
+        if (now - rapidTime < 300_000) { // Rapid failure within 5 minutes
+          if (!this.shipBlacklist.has(pending.targetShipClass)) {
+            this.shipBlacklist.set(pending.targetShipClass, now + 1_800_000); // Blacklist for 30 min
+            console.log(`[Commander] Blacklisted ${pending.targetShipClass} — not available at any visited shipyard (30min cooldown)`);
+          }
+          brain.pendingUpgrades.delete(botId);
+        }
       }
     }
 
@@ -318,10 +337,45 @@ export class Commander {
       const currentClass = catalog.find((s) => s.id === bot.shipClass);
       if (!currentClass) continue;
 
+      // Priority 1: Check if bot already owns a better ship (free switch, no purchase)
+      if (bot.ownedShips.length > 1) {
+        let bestOwnedScore = scoreShipForRole(currentClass, role);
+        let bestOwned: { id: string; classId: string } | null = null;
+        let bestOwnedClass: typeof currentClass | null = null;
+
+        for (const owned of bot.ownedShips) {
+          if (owned.classId === bot.shipClass) continue; // Skip current ship
+          const ownedShipClass = catalog.find((s) => s.id === owned.classId);
+          if (!ownedShipClass) continue;
+          const score = scoreShipForRole(ownedShipClass, role);
+          if (score > bestOwnedScore + 3) { // Must be noticeably better
+            bestOwnedScore = score;
+            bestOwned = owned;
+            bestOwnedClass = ownedShipClass;
+          }
+        }
+
+        if (bestOwned && bestOwnedClass) {
+          const roi = calculateROI(currentClass, bestOwnedClass, role);
+          brain.pendingUpgrades.set(bot.botId, {
+            targetShipClass: bestOwned.classId,
+            targetPrice: 0,
+            role,
+            roi: roi + 100, // High priority — it's free
+            alreadyOwned: true,
+            ownedShipId: bestOwned.id,
+          });
+          console.log(`[Commander] Ship switch queued (already owned): ${bot.botId} ${bot.shipClass} → ${bestOwned.classId} (role=${role}, FREE)`);
+          continue;
+        }
+      }
+
+      // Priority 2: Find an upgrade to buy from shipyard (skip blacklisted classes)
       const budget = bot.credits - minReserve;
       if (budget <= 0) continue;
 
-      const upgrade = findBestUpgrade(currentClass.id, role, catalog, budget);
+      const availableCatalog = catalog.filter((s) => !this.shipBlacklist.has(s.id));
+      const upgrade = findBestUpgrade(currentClass.id, role, availableCatalog, budget);
       if (!upgrade) continue;
 
       const roi = calculateROI(currentClass, upgrade, role);

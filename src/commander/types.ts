@@ -148,6 +148,10 @@ export interface PendingUpgrade {
   targetPrice: number;
   role: string;
   roi: number;
+  /** If true, bot already owns this ship — just switch, don't buy */
+  alreadyOwned?: boolean;
+  /** Ship instance ID to switch to (when alreadyOwned=true) */
+  ownedShipId?: string;
 }
 
 /** Goal-type weight profiles for routine scoring */

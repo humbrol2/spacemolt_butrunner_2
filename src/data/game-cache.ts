@@ -128,7 +128,44 @@ export class GameCache {
   }
 
   async getRecipes(api: ApiClient): Promise<Recipe[]> {
-    return this.getCatalogNormalized(api, "recipes", "recipe_catalog", normalizeRecipe);
+    const cacheKey = "recipe_catalog";
+    const cached = this.cache.getStatic(cacheKey, this.gameVersion);
+    if (cached) {
+      const raw = JSON.parse(cached) as Array<Record<string, unknown>>;
+      if (raw.length >= 50) return raw.map(normalizeRecipe);
+      console.log(`[Cache] Recipe catalog only has ${raw.length} recipes, re-fetching...`);
+    }
+
+    // Fetch all categories to ensure complete coverage (game has 17+ categories)
+    const categories = [
+      "refining", "manufacturing", "components", "modules", "ammunition",
+      "equipment", "electronics", "fuel", "consumables", "advanced",
+      "engineering", "weapons", "armor", "shields", "medical", "explosives",
+      "structures", "tools", "supplies",
+    ];
+    const allItems: Record<string, unknown>[] = [];
+    const seenIds = new Set<string>();
+
+    // First: fetch without category filter
+    const defaultItems = await this.fetchAllCatalogPages(api, "recipes");
+    for (const item of defaultItems) {
+      const id = String(item.id ?? item.recipe_id ?? "");
+      if (id && !seenIds.has(id)) { seenIds.add(id); allItems.push(item); }
+    }
+
+    // Then: fetch each category separately to catch anything missed
+    for (const category of categories) {
+      const catItems = await this.fetchAllCatalogPages(api, "recipes", category);
+      for (const item of catItems) {
+        const id = String(item.id ?? item.recipe_id ?? "");
+        if (id && !seenIds.has(id)) { seenIds.add(id); allItems.push(item); }
+      }
+    }
+
+    const normalized = allItems.map(normalizeRecipe);
+    this.cache.setStatic(cacheKey, JSON.stringify(normalized), this.gameVersion);
+    console.log(`[Cache] Cached ${normalized.length} recipes (${categories.length} categories searched)`);
+    return normalized;
   }
 
   /** Generic catalog fetch without normalization (ships, skills) */

@@ -104,6 +104,7 @@ export class BotManager {
         hullPct: ship ? (ship.maxHull > 0 ? (ship.hull / ship.maxHull) * 100 : 0) : 0,
         moduleIds: ship?.modules.map((m) => m.moduleId) ?? [],
         shipClass: ship?.classId ?? null,
+        ownedShips: bot.ownedShips,
         skills: bot.skillLevels,
         rapidRoutines: bot.rapidRoutines,
       });
