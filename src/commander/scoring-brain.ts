@@ -21,13 +21,13 @@ import type {
 import type { TradeRoute } from "../core/market";
 import type { PendingUpgrade } from "./types";
 import type { ShipClass } from "../types/game";
-import { scoreShipForRole } from "../core/ship-fitness";
+import { scoreShipForRole, LEGACY_SHIPS } from "../core/ship-fitness";
 import { getStrategyWeights } from "./strategies";
 
 const ALL_ROUTINES: RoutineName[] = [
   "miner", "harvester", "trader", "explorer", "crafter",
   "hunter", "salvager", "return_home", "scout", "quartermaster",
-  "ship_upgrade",
+  "ship_upgrade", "scavenger",
   // "mission_runner", // Disabled until mission system is tested
 ];
 
@@ -40,6 +40,7 @@ const ROUTINE_MAX_COUNT: Partial<Record<RoutineName, number>> = {
   scout: 1,
   explorer: 1, // Default; overridden by getMaxCount() for larger fleets
   quartermaster: 1, // Only one faction home manager
+  scavenger: 1,    // One scavenger roaming at a time
   ship_upgrade: 1, // One upgrade at a time fleet-wide
 };
 
@@ -85,20 +86,23 @@ const DEFAULT_CONFIG: ScoringConfig = {
     return_home: 5,     // Utility routine — only for idle bots away from home
     scout: 10,          // One-shot data gathering — scored high only when data is needed
     quartermaster: 35,  // Faction home manager — sells goods, buys modules
+    scavenger: 20,      // Roaming wreck looter — opportunistic income
     ship_upgrade: 0,    // Only scores > 0 when Commander queues an upgrade
   },
   supplyMultiplier: 15,
   skillBonus: 10,
-  switchCostPerTick: 3,
+  switchCostPerTick: 5,
   diversityThreshold: 2,
   diversityPenaltyPerBot: 25,
   reassignmentThreshold: 0.3,
-  reassignmentCooldownMs: 300_000, // 5 minutes
+  reassignmentCooldownMs: 1_800_000, // 30 minutes — let bots complete meaningful work cycles
 };
 
 export class ScoringBrain implements CommanderBrain {
   private config: ScoringConfig;
   private reassignmentState = new Map<string, ReassignmentState>();
+  /** Persistent tracking of active miner/harvester → belt assignments across eval cycles */
+  private activeBeltAssignments = new Map<string, string>(); // botId → beltPoiId
 
   constructor(config?: Partial<ScoringConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -126,6 +130,14 @@ export class ScoringBrain implements CommanderBrain {
       (b) => b.status === "ready" || b.status === "running"
     );
 
+    // Clean up stale belt assignments: remove bots no longer mining
+    for (const [botId] of this.activeBeltAssignments) {
+      const bot = fleet.bots.find((b) => b.botId === botId);
+      if (!bot || (bot.routine !== "miner" && bot.routine !== "harvester")) {
+        this.activeBeltAssignments.delete(botId);
+      }
+    }
+
     if (candidates.length === 0) {
       return { assignments: [], reasoning: "No bots available for assignment." };
     }
@@ -147,10 +159,21 @@ export class ScoringBrain implements CommanderBrain {
     // Get strategy weights from goals
     const weights = getStrategyWeights(goals);
 
+    // Pre-filter routines that can never win (saves 30-50% of scoring work)
+    const activeRoutines = ALL_ROUTINES.filter((r) => {
+      // ship_upgrade: skip entirely if no pending upgrades
+      if (r === "ship_upgrade" && this.pendingUpgrades.size === 0) return false;
+      // quartermaster: needs homeBase and 3+ bots
+      if (r === "quartermaster" && (!this.homeBase || fleetSize < 3)) return false;
+      // scout: only useful when homeSystem is known but data is missing
+      if (r === "scout" && this.homeBase && world?.hasAnyMarketData) return false;
+      return true;
+    });
+
     // Score all bot × routine combinations
     const allScores: BotScore[] = [];
     for (const bot of candidates) {
-      for (const routine of ALL_ROUTINES) {
+      for (const routine of activeRoutines) {
         const score = this.scoreAssignment(bot, routine, weights, economy, fleet, world);
         allScores.push(score);
       }
@@ -178,13 +201,25 @@ export class ScoringBrain implements CommanderBrain {
     // Two-pass: first let bots keep current routines within diversity threshold,
     // then assign remaining bots using per-bot best-adjusted-score.
 
+    // Pass 0: Lock bots still on cooldown — they keep their current routine unconditionally.
+    // This enforces the 30-minute minimum role duration. Only idle bots (no routine) bypass.
+    for (const bot of candidates) {
+      if (!bot.routine) continue;
+      if (!this.canReassign(bot.botId, now)) {
+        assignedBots.add(bot.botId);
+        const routine = bot.routine as RoutineName;
+        cycleRoutineCounts.set(routine, (cycleRoutineCounts.get(routine) ?? 0) + 1);
+      }
+    }
+
     // Pass 1: Auto-continue bots already on a routine within diversity threshold.
     // When more bots want the same routine than the threshold allows, keep the
     // NEWEST assignments (they just switched) and rotate OUT the longest-running
-    // ones. This ensures all bots eventually get different experiences.
+    // ones (only those whose cooldown has expired).
     const routineGroups = new Map<RoutineName, FleetBotInfo[]>();
     for (const bot of candidates) {
       if (!bot.routine) continue;
+      if (assignedBots.has(bot.botId)) continue; // Already locked by cooldown
       const routine = bot.routine as RoutineName;
       const group = routineGroups.get(routine) ?? [];
       group.push(bot);
@@ -193,32 +228,35 @@ export class ScoringBrain implements CommanderBrain {
 
     for (const [routine, bots] of routineGroups) {
       const maxCount = getMaxCount(routine, fleetSize);
+      const lockedCount = cycleRoutineCounts.get(routine) ?? 0; // Bots locked by cooldown
       const threshold = maxCount !== undefined ? Math.min(maxCount, this.config.diversityThreshold) : this.config.diversityThreshold;
+      const slotsLeft = Math.max(0, threshold - lockedCount);
 
-      if (bots.length <= threshold) {
-        // All fit within threshold — keep them all
+      if (bots.length <= slotsLeft) {
+        // All fit within remaining threshold — keep them all
         for (const bot of bots) {
           assignedBots.add(bot.botId);
           cycleRoutineCounts.set(routine, (cycleRoutineCounts.get(routine) ?? 0) + 1);
         }
-      } else {
-        // More bots than threshold — keep newest, rotate out longest-running
-        // Sort by assignment time ascending (oldest first = rotate out first)
+      } else if (slotsLeft > 0) {
+        // More bots than remaining slots — keep newest, rotate out oldest
         bots.sort((a, b) => {
           const aTime = this.reassignmentState.get(a.botId)?.lastAssignment ?? 0;
           const bTime = this.reassignmentState.get(b.botId)?.lastAssignment ?? 0;
           return aTime - bTime; // oldest first
         });
-        // Keep only the last N (newest assignments)
-        const keepers = bots.slice(bots.length - threshold);
-        const rotatedOut = bots.slice(0, bots.length - threshold);
+        const keepers = bots.slice(bots.length - slotsLeft);
+        const rotatedOut = bots.slice(0, bots.length - slotsLeft);
         for (const bot of keepers) {
           assignedBots.add(bot.botId);
           cycleRoutineCounts.set(routine, (cycleRoutineCounts.get(routine) ?? 0) + 1);
         }
         if (rotatedOut.length > 0) {
-          console.log(`[Commander] Diversity: ${routine} has ${bots.length}/${threshold} — keeping [${keepers.map(b => b.botId).join(",")}], rotating out [${rotatedOut.map(b => b.botId).join(",")}]`);
+          console.log(`[Commander] Diversity: ${routine} has ${bots.length + lockedCount}/${threshold} — rotating out [${rotatedOut.map(b => b.botId).join(",")}]`);
         }
+      } else {
+        // All slots taken by cooldown-locked bots — rotate out everyone
+        console.log(`[Commander] Diversity: ${routine} slots full (${lockedCount} locked) — rotating out [${bots.map(b => b.botId).join(",")}]`);
       }
     }
 
@@ -245,10 +283,20 @@ export class ScoringBrain implements CommanderBrain {
         if (mustSwitch && score.routine === bot.routine) continue;
 
         // Hard cap: skip if this routine has reached its max count this cycle
+        // Exception: free ship switches (alreadyOwned) bypass the cap — they're instant
         const maxCount = getMaxCount(score.routine, fleetSize);
         if (maxCount !== undefined) {
           const alreadyAssigned = cycleRoutineCounts.get(score.routine) ?? 0;
-          if (alreadyAssigned >= maxCount) continue;
+          if (alreadyAssigned >= maxCount) {
+            // Allow alreadyOwned ship switches through even when cap is hit
+            if (score.routine === "ship_upgrade") {
+              const pending = this.pendingUpgrades.get(bot.botId);
+              if (pending?.alreadyOwned) { /* exempt — free switch */ }
+              else continue;
+            } else {
+              continue;
+            }
+          }
         }
 
         // Dynamic diversity: penalize routines already assigned this cycle
@@ -291,14 +339,16 @@ export class ScoringBrain implements CommanderBrain {
       }
     }
 
-    // Log top scores per bot for diagnostics
-    for (const bot of candidates) {
-      const botScores = allScores
-        .filter((s) => s.botId === bot.botId)
-        .sort((a, b) => b.finalScore - a.finalScore)
-        .slice(0, 3);
-      const scoreStr = botScores.map((s) => `${s.routine}=${s.finalScore.toFixed(0)}`).join(", ");
-      console.log(`[Commander] ${bot.botId} (fuel=${bot.fuelPct.toFixed(0)}% mods=[${bot.moduleIds.join(",")}]): ${scoreStr}`);
+    // Log top scores per bot for diagnostics (only when assignments changed)
+    if (assignments.length > 0) {
+      for (const bot of candidates) {
+        const botScores = allScores
+          .filter((s) => s.botId === bot.botId)
+          .sort((a, b) => b.finalScore - a.finalScore)
+          .slice(0, 3);
+        const scoreStr = botScores.map((s) => `${s.routine}=${s.finalScore.toFixed(0)}`).join(", ");
+        console.log(`[Commander] ${bot.botId} (fuel=${bot.fuelPct.toFixed(0)}% mods=[${bot.moduleIds.join(",")}]): ${scoreStr}`);
+      }
     }
 
     // Fallback: if any idle bot (no routine) wasn't assigned, force-assign the best available routine
@@ -460,7 +510,9 @@ export class ScoringBrain implements CommanderBrain {
       bonus += deficit.shortfall * relevance * priorityMult * (this.config.supplyMultiplier / 10);
     }
 
-    return bonus;
+    // Cap supply bonus — observed rates can spike wildly in early session minutes,
+    // creating shortfalls of thousands that completely overwhelm all other factors
+    return Math.min(bonus, 50);
   }
 
   private routineRelevanceToDeficit(routine: RoutineName, deficit: SupplyDeficit): number {
@@ -526,7 +578,8 @@ export class ScoringBrain implements CommanderBrain {
   private calcSkillBonus(bot: FleetBotInfo, routine: RoutineName): number {
     // Ship fitness bonus: bots in better ships for a role get priority
     if (bot.shipClass && this.shipCatalog.length > 0) {
-      const shipClass = this.shipCatalog.find((s) => s.id === bot.shipClass);
+      const shipClass = this.shipCatalog.find((s) => s.id === bot.shipClass)
+        ?? LEGACY_SHIPS.find((s) => s.id === bot.shipClass);
       if (shipClass) {
         const fitness = scoreShipForRole(shipClass, routine);
         // +0 to +25 bonus based on ship fitness (normalized 0-100 → 0-25)
@@ -800,13 +853,17 @@ export class ScoringBrain implements CommanderBrain {
         if (!bot) return 200;
         const pending = this.pendingUpgrades.get(bot.botId);
         if (!pending) return 200; // No upgrade queued → block entirely
-        // Hard cap: only 1 ship_upgrade at a time
-        const upgradeCount = fleet?.bots.filter((b) => b.routine === "ship_upgrade").length ?? 0;
-        if (upgradeCount >= 1 && bot.routine !== "ship_upgrade") return 200;
+        // Hard cap: only 1 ship_upgrade at a time (exempt free switches — they're instant)
+        if (!pending.alreadyOwned) {
+          const upgradeCount = fleet?.bots.filter((b) => b.routine === "ship_upgrade").length ?? 0;
+          if (upgradeCount >= 1 && bot.routine !== "ship_upgrade") return 200;
+        }
         // Base 70 when upgrade is queued — high enough to interrupt most activities
         let bonus = -70;
         // ROI bonus: better deals score higher (cap -20)
         bonus -= Math.min(20, pending.roi * 10);
+        // Free switch bonus: already-owned ships get priority (it's instant and free)
+        if (pending.alreadyOwned) bonus -= 50;
         return bonus;
       }
       default:
@@ -859,8 +916,13 @@ export class ScoringBrain implements CommanderBrain {
 
     // Base params - routines use these to guide behavior
     switch (routine) {
-      case "miner":
-        return this.buildMinerParams(bot, economy, existingAssignments, world);
+      case "miner": {
+        const params = this.buildMinerParams(bot, economy, existingAssignments, world);
+        // Persist belt assignment for cross-cycle deconfliction
+        if (params.targetBelt) this.activeBeltAssignments.set(bot.botId, String(params.targetBelt));
+        else this.activeBeltAssignments.delete(bot.botId);
+        return params;
+      }
       case "harvester":
         return this.buildHarvesterParams(bot, economy, existingAssignments, world);
       case "trader":
@@ -870,7 +932,7 @@ export class ScoringBrain implements CommanderBrain {
       case "crafter":
         return this.buildCrafterParams(bot, economy, existingAssignments);
       case "hunter":
-        return { huntZone: "", fleeThreshold: 25, engagementRules: "npcs_only" };
+        return { huntZone: "", fleeThreshold: 25, engagementRules: "all" };
       case "salvager":
         return { salvageYard: homeBase || "", scrapMethod: "scrap" };
       case "mission_runner":
@@ -880,7 +942,13 @@ export class ScoringBrain implements CommanderBrain {
       case "scout":
         return { targetSystem: this.homeSystem, scanMarket: true, checkFaction: true };
       case "quartermaster":
-        return { homeBase: this.homeBase };
+        return {
+          homeBase: this.homeBase,
+          buyOrderBudgetPct: 0.30,
+          maxOrderAge: 7_200_000, // 2 hours
+        };
+      case "scavenger":
+        return { sellMode: isFactionMode ? "faction_deposit" : "sell" };
       case "ship_upgrade":
         return this.buildShipUpgradeParams(bot);
       default:
@@ -926,11 +994,7 @@ export class ScoringBrain implements CommanderBrain {
       }
     }
 
-    // Standard arbitrage trading
-    if (!world || world.tradeRoutes.length === 0) {
-      return { buyStation: "", sellStation: "", item: "", useOrders: false };
-    }
-
+    // Standard arbitrage trading — per-bot route evaluation
     // Collect items+routes already assigned to other traders this cycle
     const claimedRoutes = new Set<string>();
     const claimedItems = new Set<string>();
@@ -941,8 +1005,19 @@ export class ScoringBrain implements CommanderBrain {
       }
     }
 
+    // Per-bot arbitrage: use this bot's location and cargo capacity for accurate ranking
+    let routes: TradeRoute[] = world?.tradeRoutes ?? [];
+    if (this.market && world?.cachedStationIds && world.cachedStationIds.length >= 2 && bot.systemId) {
+      const cargo = bot.cargoCapacity > 0 ? bot.cargoCapacity : 100;
+      routes = this.market.findArbitrage(world.cachedStationIds, bot.systemId, cargo).slice(0, 10);
+    }
+
+    if (routes.length === 0) {
+      return { buyStation: "", sellStation: "", item: "", useOrders: false };
+    }
+
     // Find the best unclaimed trade route (skip ores — miners handle those)
-    for (const route of world.tradeRoutes) {
+    for (const route of routes) {
       if (route.itemId.startsWith("ore_")) continue;
       const routeKey = `${route.itemId}|${route.buyStationId}|${route.sellStationId}`;
       if (claimedRoutes.has(routeKey)) continue;
@@ -972,6 +1047,8 @@ export class ScoringBrain implements CommanderBrain {
   crafting: import("../core/crafting").Crafting | null = null;
   /** Galaxy service (set by Commander for belt-aware miner params) */
   galaxy: import("../core/galaxy").Galaxy | null = null;
+  /** Market service (set by Commander for per-bot arbitrage) */
+  market: import("../core/market").Market | null = null;
   /** Pending ship upgrades queued by Commander (botId → upgrade info) */
   pendingUpgrades = new Map<string, PendingUpgrade>();
   /** Ship catalog (set by Commander for ship fitness scoring) */
@@ -1019,8 +1096,17 @@ export class ScoringBrain implements CommanderBrain {
     const available = crafting.getAvailableRecipes(bot.skills ?? {});
     if (available.length === 0) return baseParams;
 
-    // Score each recipe
-    const scored: Array<{ recipe: typeof available[0]; score: number; reason: string }> = [];
+    // Pre-compute: which items are used as ingredients in ANY recipe
+    const allRecipes = crafting.getAllRecipes();
+    const ingredientUsageCount = new Map<string, number>();
+    for (const r of allRecipes) {
+      for (const ing of r.ingredients) {
+        ingredientUsageCount.set(ing.itemId, (ingredientUsageCount.get(ing.itemId) ?? 0) + 1);
+      }
+    }
+
+    // Score each recipe — prefer highest tier WHERE materials are available
+    const scored: Array<{ recipe: typeof available[0]; score: number; reason: string; heaviestStep: number }> = [];
     for (const recipe of available) {
       if (claimedRecipes.has(recipe.id)) continue;
       if (claimedOutputs.has(recipe.outputItem)) continue; // Don't flood same item
@@ -1028,96 +1114,164 @@ export class ScoringBrain implements CommanderBrain {
       let score = 0;
       let reason = "";
 
-      // Factor 1: Estimated profit (base catalog prices)
-      const profit = crafting.estimateProfit(recipe.id);
-      if (profit > 0) {
-        score += Math.min(profit / 10, 50); // Cap at 50 points
-        reason = `profit:${profit}cr`;
-      }
-
-      // Factor 2: Can we actually craft this with faction storage materials?
+      // ── Material availability (check FIRST — gates the tier bonus) ──
+      // Raw materials (resolved through full chain): can we craft from scratch?
+      const chain = crafting.buildChain(recipe.id, 1);
+      const chainDepth = chain.length;
       const rawMaterials = crafting.getRawMaterials(recipe.id, 1);
-      let hasMaterials = true;
-      let materialScore = 0;
+      let hasAllRaws = true;
+      let rawsAvailableCount = 0;
+      let rawsMissingCount = 0;
       for (const [itemId, needed] of rawMaterials) {
         const inStorage = economy.factionStorage.get(itemId) ?? 0;
         if (inStorage >= needed) {
-          materialScore += 10; // Bonus per ingredient available
+          rawsAvailableCount++;
         } else {
-          hasMaterials = false;
+          hasAllRaws = false;
+          if (inStorage === 0) rawsMissingCount++; // Completely absent — not even 1 unit
         }
       }
-      if (hasMaterials && rawMaterials.size > 0) {
-        score += 30; // Big bonus if we can craft right now
-        reason += " +materials_ready";
-      } else if (rawMaterials.size > 0) {
-        score -= 100; // Heavy penalty — this recipe will fail immediately
-        reason += " -no_materials";
-      }
-      score += materialScore;
 
-      // Factor 3: Output is an ingredient for ANY recipes (fleet-wide supply chain value)
-      // Check ALL recipes, not just this bot's available ones
-      const allRecipes = crafting.getAllRecipes();
-      const recipesUsingOutput = allRecipes.filter((r) =>
-        r.ingredients.some((i) => i.itemId === recipe.outputItem)
-      );
-      if (recipesUsingOutput.length > 0) {
-        score += 15; // Intermediate product that feeds the chain
+      // Intermediates already in storage? (shortcut — skip earlier chain steps)
+      let hasImmediateIngredients = false;
+      if (chainDepth > 1) {
+        hasImmediateIngredients = recipe.ingredients.every(
+          (ing) => (economy.factionStorage.get(ing.itemId) ?? 0) >= ing.quantity,
+        );
+        if (hasImmediateIngredients) {
+          score += 20; // Big bonus — chain already done, just assemble
+          reason += "+intermediates_ready";
+        }
+      }
+
+      const canCraft = hasAllRaws || hasImmediateIngredients;
+      if (canCraft) {
+        score += 30;
+        reason += " +materials_ready";
+      } else {
+        // Penalty scales with missing material types — complex impossible recipes get crushed
+        score -= 50 + rawsMissingCount * 30;
+        reason += ` -missing:${rawsMissingCount}/${rawMaterials.size}`;
+      }
+      score += rawsAvailableCount * 5;
+
+      // ── Cargo feasibility — skip recipes that can't fit in this ship ──
+      let heaviestStepInputs = 0;
+      for (const step of chain) {
+        const stepInputs = step.inputs.reduce((sum, inp) => sum + inp.quantity, 0);
+        heaviestStepInputs = Math.max(heaviestStepInputs, stepInputs);
+      }
+      if (heaviestStepInputs > bot.cargoCapacity) {
+        // Recipe fundamentally requires more cargo than ship can hold — skip entirely
+        reason += ` SKIP:cargo(need ${heaviestStepInputs}, have ${bot.cargoCapacity})`;
+        scored.push({ recipe, score: -999, reason, heaviestStep: heaviestStepInputs });
+        continue;
+      }
+
+      // ── Tier bonus — ONLY when materials are available ──
+      // High-tier recipes score higher, but only if we can actually craft them
+      if (chainDepth > 1 && canCraft) {
+        const tierBonus = Math.min(chainDepth * 20, 60); // Cap at +60
+        score += tierBonus;
+        reason += ` tier:${chainDepth}(+${tierBonus})`;
+      } else if (chainDepth > 1) {
+        reason += ` tier:${chainDepth}(gated)`;
+      }
+
+      // ── Estimated profit (base catalog prices) ──
+      const profit = crafting.estimateProfit(recipe.id);
+      if (profit > 0) {
+        score += Math.min(profit / 10, 50); // Cap at 50 points
+        reason += ` profit:${profit}cr`;
+      }
+
+      // Factor 4: Supply chain value — output feeds higher-tier recipes
+      const usageCount = ingredientUsageCount.get(recipe.outputItem) ?? 0;
+      if (usageCount > 0) {
+        score += 15;
         reason += " +chain_value";
-        // Extra bonus if the output is actually MISSING from faction storage
-        // (demand-pull: someone needs this but we have none)
         const outputStock = economy.factionStorage.get(recipe.outputItem) ?? 0;
         if (outputStock === 0) {
-          score += 40; // Strong bonus — this intermediate is blocking other crafters
+          score += 40; // Blocking other crafters
           reason += " +demand_deficit";
         } else if (outputStock < 10) {
-          score += 20; // Moderate bonus — low stock of needed intermediate
+          score += 20;
           reason += " +demand_low";
         }
       }
 
-      // Factor 4: XP rewards for skill progression
-      const xpEntries = Object.entries(recipe.xpRewards);
-      if (xpEntries.length > 0) {
-        // Bonus for skills that are low (more room to grow)
-        for (const [skillId, xp] of xpEntries) {
-          const currentLevel = bot.skills?.[skillId] ?? 0;
-          if (currentLevel < 5) {
-            score += xp * (5 - currentLevel); // More bonus for lower skills
-            reason += ` +xp:${skillId}`;
-          }
+      // Factor 5: XP rewards for skill progression
+      for (const [skillId, xp] of Object.entries(recipe.xpRewards)) {
+        const currentLevel = bot.skills?.[skillId] ?? 0;
+        if (currentLevel < 5) {
+          score += xp * (5 - currentLevel);
+          reason += ` +xp:${skillId}`;
         }
       }
 
-      // Factor 5: Market demand signal — items with confirmed sell prices
-      // Higher base price = likely more valuable crafted goods
+      // Factor 6: Output value — higher base price = more valuable goods
       const outputPrice = crafting.getItemBasePrice(recipe.outputItem);
       if (outputPrice > 0) {
-        score += Math.min(outputPrice / 20, 30); // Higher value items score better
+        score += Math.min(outputPrice / 20, 30);
       }
 
-      // Factor 6: Inventory saturation penalty — deprioritize items we already have lots of
-      // Prevents spamming 10k of a single item, encourages diversity
+      // Factor 7: Inventory saturation — aggressive overproduction prevention
+      // End products (not used in other recipes) get a tight ceiling (30 units).
+      // Intermediates (ingredients for higher-tier recipes) get a lenient ceiling (100 units).
       const outputInStorage = economy.factionStorage.get(recipe.outputItem) ?? 0;
-      if (outputInStorage > 0) {
-        // Logarithmic penalty: 5 items = -8, 20 items = -15, 100 items = -23, 500 items = -31
-        const saturationPenalty = Math.round(Math.log2(outputInStorage + 1) * 5);
+      const isIntermediate = usageCount > 0;
+      const stockCeiling = isIntermediate ? 100 : 30;
+
+      if (outputInStorage >= stockCeiling) {
+        // Over ceiling: harsh penalty that scales with excess ratio
+        const excessRatio = outputInStorage / stockCeiling;
+        const saturationPenalty = Math.min(300, Math.round(50 + excessRatio * 20));
         score -= saturationPenalty;
-        reason += ` -inventory:${outputInStorage}`;
+        reason += ` -OVERSATURATED:${outputInStorage}/${stockCeiling}`;
+      } else if (outputInStorage > 5) {
+        // Approaching ceiling: linear ramp up to -30 at ceiling
+        const ratio = outputInStorage / stockCeiling;
+        const penalty = Math.round(ratio * 30);
+        score -= penalty;
+        reason += ` -inventory:${outputInStorage}/${stockCeiling}`;
       }
 
-      scored.push({ recipe, score, reason });
+      // Factor 8: Fleet consumable bonus — fuel cells are burned constantly by every bot
+      if (recipe.outputItem === "fuel_cell" || recipe.outputItem === "fuel_cell_premium") {
+        const fuelStock = economy.factionStorage.get(recipe.outputItem) ?? 0;
+        const fleetSize = existingAssignments.length || 1;
+        const fuelTarget = fleetSize * 10; // ~10 cells per bot as comfortable buffer
+        if (fuelStock < fuelTarget) {
+          const urgency = Math.min(60, Math.round((1 - fuelStock / fuelTarget) * 60));
+          score += urgency;
+          reason += ` +fuel_need(${fuelStock}/${fuelTarget})`;
+        }
+      }
+
+      scored.push({ recipe, score, reason, heaviestStep: heaviestStepInputs });
     }
 
     // Sort by score descending
     scored.sort((a, b) => b.score - a.score);
 
-    if (scored.length > 0) {
+    if (scored.length > 0 && scored[0].score > -999) {
       const best = scored[0];
+      // Calculate max batch count constrained by: materials, cargo space, and cap of 5
+      const rawMaterials = crafting.getRawMaterials(best.recipe.id, 1);
+      let maxByMaterials = 10;
+      for (const [itemId, perBatch] of rawMaterials) {
+        const inStorage = economy.factionStorage.get(itemId) ?? 0;
+        maxByMaterials = Math.min(maxByMaterials, Math.floor(inStorage / perBatch));
+      }
+      // Cargo constraint: reuse heaviest step from scoring loop
+      const maxByCargo = best.heaviestStep > 0
+        ? Math.floor(bot.cargoCapacity / best.heaviestStep)
+        : 10;
+      const batchCount = Math.max(1, Math.min(maxByMaterials, maxByCargo, 5));
       return {
         ...baseParams,
         recipeId: best.recipe.id,
+        count: batchCount,
       };
     }
 
@@ -1211,12 +1365,16 @@ export class ScoringBrain implements CommanderBrain {
     );
     uniqueStock.sort((a, b) => a.stock - b.stock); // Lowest stock first
 
-    // Collect belts already claimed by other miners this eval
+    // Collect belts already claimed by other miners — both this eval AND persistent active assignments
     const claimedBelts = new Set<string>();
     for (const a of existingAssignments) {
       if (a.routine === "miner" && a.params.targetBelt) {
         claimedBelts.add(String(a.params.targetBelt));
       }
+    }
+    // Include persistent belt assignments from previous eval cycles
+    for (const [botId, beltId] of this.activeBeltAssignments) {
+      if (botId !== bot.botId) claimedBelts.add(beltId);
     }
 
     // Find best belt: iterate through needed resource types, find unclaimed non-depleted POIs
@@ -1236,8 +1394,11 @@ export class ScoringBrain implements CommanderBrain {
         for (const { systemId, poi } of pois) {
           if (claimedBelts.has(poi.id)) continue;
           if (!hasResourcesLeft(poi)) continue;
-          // Calculate distance from bot's current system
-          const distance = botSystem ? (systemId === botSystem ? 0 : 1) : 99;
+          // Real BFS distance from bot's current system
+          const distance = botSystem
+            ? (systemId === botSystem ? 0 : this.galaxy.getDistance(botSystem, systemId))
+            : 99;
+          if (distance < 0) continue; // Unreachable system
           candidates.push({ systemId, poiId: poi.id, distance });
         }
       }
@@ -1357,7 +1518,7 @@ export class ScoringBrain implements CommanderBrain {
       return a.stock - b.stock;
     });
 
-    // Collect POIs already claimed by miners or harvesters
+    // Collect POIs already claimed by miners or harvesters (this eval + persistent)
     const claimedPois = new Set<string>();
     for (const a of existingAssignments) {
       if (a.routine === "miner" && a.params.targetBelt) {
@@ -1368,6 +1529,10 @@ export class ScoringBrain implements CommanderBrain {
           claimedPois.add(t.poiId);
         }
       }
+    }
+    // Include persistent belt assignments from previous eval cycles
+    for (const [botId, beltId] of this.activeBeltAssignments) {
+      if (botId !== bot.botId) claimedPois.add(beltId);
     }
 
     const botSystem = bot.systemId ?? this.homeSystem;
@@ -1386,7 +1551,10 @@ export class ScoringBrain implements CommanderBrain {
         for (const { systemId, poi } of pois) {
           if (claimedPois.has(poi.id)) continue;
           if (!hasResourcesLeft(poi)) continue;
-          const distance = botSystem ? (systemId === botSystem ? 0 : 1) : 99;
+          const distance = botSystem
+            ? (systemId === botSystem ? 0 : this.galaxy.getDistance(botSystem, systemId))
+            : 99;
+          if (distance < 0) continue; // Unreachable
           candidates.push({ systemId, poiId: poi.id, distance });
         }
       }

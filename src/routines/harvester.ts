@@ -20,6 +20,7 @@ import {
   safetyCheck,
   getParam,
   isProtectedItem,
+  equipModulesForRoutine,
 } from "./helpers";
 
 interface HarvestTarget {
@@ -36,93 +37,7 @@ export async function* harvester(ctx: BotContext): AsyncGenerator<string, void, 
   const unequipModules = getParam<string[]>(ctx, "unequipModules", []);
 
   // ── Equip/unequip modules if commanded by scoring brain ──
-  if ((equipModules.length > 0 || unequipModules.length > 0) && ctx.player.dockedAtBase) {
-    for (const modId of unequipModules) {
-      if (ctx.shouldStop) return;
-      try {
-        await ctx.api.uninstallMod(modId);
-        await ctx.refreshState();
-        yield `unequipped ${modId}`;
-      } catch (err) {
-        yield `unequip ${modId} failed: ${err instanceof Error ? err.message : String(err)}`;
-      }
-    }
-    for (const modPattern of equipModules) {
-      if (ctx.shouldStop) return;
-      if (ctx.ship.modules.some((m) => m.moduleId.includes(modPattern))) continue;
-      const inCargo = ctx.ship.cargo.find((c) => c.itemId.includes(modPattern));
-      if (inCargo) {
-        try {
-          await ctx.api.installMod(inCargo.itemId);
-          await ctx.refreshState();
-          yield `equipped ${inCargo.itemId} from cargo`;
-          continue;
-        } catch (err) {
-          yield `equip ${inCargo.itemId} failed: ${err instanceof Error ? err.message : String(err)}`;
-        }
-      }
-      try {
-        const storage = await ctx.api.viewFactionStorage();
-        const mod = (storage ?? []).find((s) => s.itemId.includes(modPattern) && s.quantity > 0);
-        if (mod) {
-          await ctx.api.factionWithdrawItems(mod.itemId, 1);
-          await ctx.refreshState();
-          yield `withdrew ${mod.itemId} from faction storage`;
-          try {
-            await ctx.api.installMod(mod.itemId);
-            await ctx.refreshState();
-            yield `equipped ${mod.itemId}`;
-          } catch (err) {
-            yield `equip ${mod.itemId} failed: ${err instanceof Error ? err.message : String(err)}`;
-            try {
-              await ctx.api.factionDepositItems(mod.itemId, 1);
-              await ctx.refreshState();
-            } catch { /* best effort */ }
-          }
-        }
-      } catch (err) {
-        yield `module withdraw failed: ${err instanceof Error ? err.message : String(err)}`;
-      }
-    }
-  } else if ((equipModules.length > 0 || unequipModules.length > 0) && !ctx.player.dockedAtBase) {
-    // Need to dock first to equip/unequip modules
-    try {
-      await findAndDock(ctx);
-      for (const modId of unequipModules) {
-        if (ctx.shouldStop) return;
-        try {
-          await ctx.api.uninstallMod(modId);
-          await ctx.refreshState();
-          yield `unequipped ${modId}`;
-        } catch (err) {
-          yield `unequip ${modId} failed: ${err instanceof Error ? err.message : String(err)}`;
-        }
-      }
-      for (const modPattern of equipModules) {
-        if (ctx.shouldStop) return;
-        if (ctx.ship.modules.some((m) => m.moduleId.includes(modPattern))) continue;
-        try {
-          const storage = await ctx.api.viewFactionStorage();
-          const mod = (storage ?? []).find((s) => s.itemId.includes(modPattern) && s.quantity > 0);
-          if (mod) {
-            await ctx.api.factionWithdrawItems(mod.itemId, 1);
-            await ctx.refreshState();
-            await ctx.api.installMod(mod.itemId);
-            await ctx.refreshState();
-            yield `equipped ${mod.itemId}`;
-          }
-        } catch (err) {
-          yield `equip failed: ${err instanceof Error ? err.message : String(err)}`;
-        }
-      }
-      if (ctx.player.dockedAtBase) {
-        await ctx.api.undock();
-        await ctx.refreshState();
-      }
-    } catch {
-      yield "could not dock for module equip — continuing without";
-    }
-  }
+  yield* equipModulesForRoutine(ctx, equipModules, unequipModules);
 
   // Auto-discover targets if empty
   if (rawTargets.length === 0) {
@@ -199,28 +114,35 @@ export async function* harvester(ctx: BotContext): AsyncGenerator<string, void, 
       if (ctx.shouldStop) return;
 
       // Mine/harvest at this location
-      while (!ctx.shouldStop && ctx.cargo.hasSpace(ctx.ship, 1)) {
-        yield `harvesting ${resourceType}`;
-        try {
-          const result = await ctx.api.mine();
-          await ctx.refreshState();
+      {
+        let mineCount = 0;
+        while (!ctx.shouldStop && ctx.cargo.hasSpace(ctx.ship, 1)) {
+          yield `harvesting ${resourceType}`;
+          try {
+            const result = await ctx.api.mine();
+            mineCount++;
+            if (mineCount % 5 === 0 || result.quantity === 0 || result.remaining === 0) {
+              await ctx.refreshState();
+            }
 
-          if (result.quantity === 0 || result.remaining === 0) {
-            yield `${target.poiId} depleted`;
+            if (result.quantity === 0 || result.remaining === 0) {
+              yield `${target.poiId} depleted`;
+              break;
+            }
+
+            yield `harvested ${result.quantity} ${result.resourceId}`;
+          } catch (err) {
+            yield `harvest error: ${err instanceof Error ? err.message : String(err)}`;
             break;
           }
 
-          yield `harvested ${result.quantity} ${result.resourceId}`;
-        } catch (err) {
-          yield `harvest error: ${err instanceof Error ? err.message : String(err)}`;
-          break;
+          // Fuel safety
+          if (ctx.fuel.getLevel(ctx.ship) === "critical") {
+            yield "fuel critical, aborting harvest";
+            break;
+          }
         }
-
-        // Fuel safety
-        if (ctx.fuel.getLevel(ctx.ship) === "critical") {
-          yield "fuel critical, aborting harvest";
-          break;
-        }
+        if (mineCount > 0) await ctx.refreshState();
       }
     }
 
@@ -257,7 +179,8 @@ export async function* harvester(ctx: BotContext): AsyncGenerator<string, void, 
     // Deposit all cargo
     const depositMode = mode === "faction_deposit" ? "faction" : "personal";
     yield `depositing materials (${depositMode} storage)`;
-    for (const item of ctx.ship.cargo) {
+    const cargoSnapshot = [...ctx.ship.cargo]; // Snapshot before depositing
+    for (const item of cargoSnapshot) {
       if (ctx.shouldStop) return;
       if (isProtectedItem(item.itemId)) continue;
       try {
@@ -266,20 +189,19 @@ export async function* harvester(ctx: BotContext): AsyncGenerator<string, void, 
         } else {
           await depositItem(ctx, item.itemId);
         }
-        await ctx.refreshState();
         yield `deposited ${item.quantity} ${item.itemId}`;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         yield `deposit failed for ${item.itemId}: ${msg}, selling instead`;
         try {
           const result = await ctx.api.sell(item.itemId, item.quantity);
-          await ctx.refreshState();
           yield `sold ${result.quantity} ${item.itemId} @ ${result.priceEach}cr = ${result.total}cr`;
         } catch {
           yield `sell also failed for ${item.itemId}, skipping`;
         }
       }
     }
+    await ctx.refreshState(); // Single refresh after all deposits
 
     // Service
     await refuelIfNeeded(ctx);

@@ -238,43 +238,69 @@
 		</div>
 	</div>
 
-	<!-- Open orders -->
+	<!-- Open orders (grouped by station) -->
 	<div class="card p-4">
 		<h2 class="text-sm font-semibold text-chrome-silver uppercase tracking-wider mb-3">
 			Open Orders
+			{#if $economy?.openOrders?.length}
+				<span class="text-hull-grey font-normal ml-2">({$economy.openOrders.length})</span>
+			{/if}
 		</h2>
 		{#if !$economy?.openOrders?.length}
 			<p class="text-sm text-hull-grey py-8 text-center">No open orders</p>
 		{:else}
-			<div class="overflow-x-auto">
-				<table class="w-full text-sm">
-					<thead>
-						<tr class="text-left text-xs text-chrome-silver uppercase tracking-wider border-b border-hull-grey/30">
-							<th class="pb-2 pr-4">Type</th>
-							<th class="pb-2 pr-4">Item</th>
-							<th class="pb-2 pr-4">Station</th>
-							<th class="pb-2 pr-4 text-right">Price</th>
-							<th class="pb-2 pr-4 text-right">Filled</th>
-							<th class="pb-2">Bot</th>
-						</tr>
-					</thead>
-					<tbody class="divide-y divide-hull-grey/20">
-						{#each $economy.openOrders as order}
-							<tr class="hover:bg-nebula-blue/20 transition-colors">
-								<td class="py-2 pr-4">
-									<span class="text-xs font-medium px-2 py-0.5 rounded {order.type === 'buy' ? 'bg-bio-green/20 text-bio-green' : 'bg-shell-orange/20 text-shell-orange'}">
-										{order.type.toUpperCase()}
-									</span>
-								</td>
-								<td class="py-2 pr-4 text-star-white">{order.itemName}</td>
-								<td class="py-2 pr-4 text-chrome-silver text-xs">{order.stationName}</td>
-								<td class="py-2 pr-4 text-right mono text-star-white">{order.priceEach.toLocaleString()}</td>
-								<td class="py-2 pr-4 text-right mono text-chrome-silver">{order.filled}/{order.quantity}</td>
-								<td class="py-2 text-xs text-laser-blue">{order.botId}</td>
-							</tr>
-						{/each}
-					</tbody>
-				</table>
+			{@const grouped = $economy.openOrders.reduce((acc, o) => {
+				const key = o.stationName || o.stationId || "Unknown";
+				if (!acc.has(key)) acc.set(key, []);
+				acc.get(key)!.push(o);
+				return acc;
+			}, new Map<string, typeof $economy.openOrders>())}
+			<div class="space-y-4">
+				{#each [...grouped.entries()] as [station, orders]}
+					<div>
+						<div class="flex items-center gap-2 mb-2">
+							<span class="text-xs font-medium text-plasma-cyan">{station}</span>
+							<span class="text-xs text-hull-grey">({orders.length} order{orders.length !== 1 ? "s" : ""})</span>
+						</div>
+						<div class="overflow-x-auto">
+							<table class="w-full text-sm">
+								<thead>
+									<tr class="text-left text-xs text-chrome-silver uppercase tracking-wider border-b border-hull-grey/30">
+										<th class="pb-2 pr-3">Type</th>
+										<th class="pb-2 pr-3">Item</th>
+										<th class="pb-2 pr-3 text-right">Qty</th>
+										<th class="pb-2 pr-3 text-right">Price</th>
+										<th class="pb-2 pr-3 text-right">Total</th>
+										<th class="pb-2 pr-3 text-right">Filled</th>
+										<th class="pb-2 pr-3 text-right">Age</th>
+										<th class="pb-2">Bot</th>
+									</tr>
+								</thead>
+								<tbody class="divide-y divide-hull-grey/20">
+									{#each orders as order}
+										{@const age = order.createdAt ? Math.floor((Date.now() - new Date(order.createdAt).getTime()) / 60_000) : -1}
+										<tr class="hover:bg-nebula-blue/20 transition-colors">
+											<td class="py-1.5 pr-3">
+												<span class="text-xs font-medium px-2 py-0.5 rounded {order.type === 'buy' ? 'bg-bio-green/20 text-bio-green' : 'bg-shell-orange/20 text-shell-orange'}">
+													{order.type.toUpperCase()}
+												</span>
+											</td>
+											<td class="py-1.5 pr-3 text-star-white">{order.itemName}</td>
+											<td class="py-1.5 pr-3 text-right mono text-chrome-silver">{order.quantity}</td>
+											<td class="py-1.5 pr-3 text-right mono text-star-white">{order.priceEach.toLocaleString()}cr</td>
+											<td class="py-1.5 pr-3 text-right mono text-star-white/70">{(order.priceEach * order.quantity).toLocaleString()}cr</td>
+											<td class="py-1.5 pr-3 text-right mono {order.filled > 0 ? 'text-bio-green' : 'text-hull-grey'}">{order.filled}/{order.quantity}</td>
+											<td class="py-1.5 pr-3 text-right text-xs {age > 60 ? 'text-shell-orange' : 'text-hull-grey'}">
+												{#if age < 0}—{:else if age < 60}{age}m{:else if age < 1440}{Math.floor(age / 60)}h{:else}{Math.floor(age / 1440)}d{/if}
+											</td>
+											<td class="py-1.5 text-xs text-laser-blue">{order.botId}</td>
+										</tr>
+									{/each}
+								</tbody>
+							</table>
+						</div>
+					</div>
+				{/each}
 			</div>
 		{/if}
 	</div>

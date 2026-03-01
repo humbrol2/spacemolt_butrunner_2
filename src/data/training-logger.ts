@@ -15,7 +15,52 @@ export class TrainingLogger {
     marketHistory: true,
   };
 
+  /** Buffered snapshots for batch insert */
+  private snapshotBuffer: Array<{
+    tick: number; botId: string;
+    playerState: Record<string, unknown>;
+    shipState: Record<string, unknown>;
+    location: Record<string, unknown>;
+  }> = [];
+  private snapshotFlushTimer: ReturnType<typeof setInterval> | null = null;
+
   constructor(private db: Database) {}
+
+  /** Start the periodic flush timer (call from main app, not needed in tests) */
+  startSnapshotFlush(): void {
+    if (this.snapshotFlushTimer) return;
+    this.snapshotFlushTimer = setInterval(() => this.flushSnapshots(), 10_000);
+  }
+
+  /** Flush buffered snapshots — call on shutdown */
+  flushSnapshots(): void {
+    if (this.snapshotBuffer.length === 0) return;
+    const batch = this.snapshotBuffer;
+    this.snapshotBuffer = [];
+    const stmt = this.db.prepare(
+      `INSERT INTO state_snapshots (tick, bot_id, player_state, ship_state, location, game_version, commander_version)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    );
+    const tx = this.db.transaction(() => {
+      for (const s of batch) {
+        stmt.run(
+          s.tick, s.botId,
+          JSON.stringify(s.playerState), JSON.stringify(s.shipState), JSON.stringify(s.location),
+          this.gameVersion, commanderVersion,
+        );
+      }
+    });
+    tx();
+  }
+
+  /** Stop flush timer (call on shutdown) */
+  destroy(): void {
+    if (this.snapshotFlushTimer) {
+      clearInterval(this.snapshotFlushTimer);
+      this.snapshotFlushTimer = null;
+    }
+    this.flushSnapshots();
+  }
 
   setGameVersion(version: string): void {
     this.gameVersion = version;
@@ -53,7 +98,7 @@ export class TrainingLogger {
     );
   }
 
-  /** Log a full bot state snapshot */
+  /** Log a full bot state snapshot (buffered — flushed every 10s in a single transaction) */
   logSnapshot(params: {
     tick: number;
     botId: string;
@@ -62,19 +107,7 @@ export class TrainingLogger {
     location: Record<string, unknown>;
   }): void {
     if (!this.enabled.snapshots) return;
-    this.db.run(
-      `INSERT INTO state_snapshots (tick, bot_id, player_state, ship_state, location, game_version, commander_version)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        params.tick,
-        params.botId,
-        JSON.stringify(params.playerState),
-        JSON.stringify(params.shipState),
-        JSON.stringify(params.location),
-        this.gameVersion,
-        commanderVersion,
-      ]
-    );
+    this.snapshotBuffer.push(params);
   }
 
   /** Log a completed episode (mining run, trade route, etc.) */

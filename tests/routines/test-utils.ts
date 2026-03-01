@@ -108,11 +108,15 @@ export function buildMockContext(overrides?: {
     },
     sell: async (itemId: string, qty: number): Promise<TradeResult> => {
       tracker.calls.push(`sell:${itemId}:${qty}`);
-      const total = qty * 10;
+      // Use cached sell price if available (prevents recordSellResult from corrupting cache)
+      const cachedPrices = mockCache.marketPricesData.get(player.dockedAtBase ?? "");
+      const cachedPrice = cachedPrices?.find((p) => p.itemId === itemId)?.sellPrice;
+      const priceEach = cachedPrice ?? 10;
+      const total = qty * priceEach;
       player.credits += total;
       ship.cargo = ship.cargo.filter((c) => c.itemId !== itemId);
       ship.cargoUsed = ship.cargo.reduce((s, c) => s + c.quantity, 0);
-      return { itemId, quantity: qty, priceEach: 10, total };
+      return { itemId, quantity: qty, priceEach, total };
     },
     buy: async (itemId: string, qty: number): Promise<TradeResult> => {
       tracker.calls.push(`buy:${itemId}:${qty}`);

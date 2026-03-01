@@ -78,6 +78,8 @@ export interface FleetBotInfo {
   moduleIds: string[];
   /** Ship class ID (e.g. "shuttle", "hauler") */
   shipClass: string | null;
+  /** Ship cargo capacity in weight units */
+  cargoCapacity: number;
   /** All ships this bot owns: [{id, classId}] — populated after login */
   ownedShips: Array<{ id: string; classId: string }>;
   /** Bot skill levels (e.g. { mining: 3, trading: 1 }) */

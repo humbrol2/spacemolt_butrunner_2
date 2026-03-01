@@ -38,7 +38,7 @@ export type Goal = z.infer<typeof GoalSchema>;
 
 export const CommanderConfigSchema = z.object({
   brain: z.enum(["scoring", "llm", "hybrid"]).default("scoring"),
-  evaluation_interval: z.number().default(60),
+  evaluation_interval: z.number().default(180),
   reassignment_cooldown: z.number().default(300),
   reassignment_threshold: z.number().default(0.3),
   switch_cost_weight: z.number().default(1.0),

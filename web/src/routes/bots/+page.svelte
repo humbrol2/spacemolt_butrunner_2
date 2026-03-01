@@ -121,6 +121,12 @@
 							<span class="text-chrome-silver">Location</span>
 							<span class="text-star-white">{bot.systemName ?? "Unknown"}{#if bot.poiName} - {bot.poiName}{/if}</span>
 						</div>
+						{#if bot.destination}
+							<div class="flex justify-between">
+								<span class="text-chrome-silver">Destination</span>
+								<span class="text-plasma-cyan">{bot.destination}{#if bot.jumpsRemaining != null} <span class="text-hull-grey">({bot.jumpsRemaining}J)</span>{/if}</span>
+							</div>
+						{/if}
 
 						<!-- Fuel/Cargo bars -->
 						<div class="pt-1">

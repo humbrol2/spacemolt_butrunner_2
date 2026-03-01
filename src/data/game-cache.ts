@@ -21,6 +21,8 @@ export class GameCache {
   private gameVersion: string = "unknown";
   /** Tracks when each station's market was last cached (in-memory, survives cache expiry) */
   private marketFetchedAt = new Map<string, number>();
+  /** Dirty flag: set when market data changes, cleared after broadcast */
+  marketDirty = false;
 
   constructor(
     private cache: CacheHelper,
@@ -120,7 +122,20 @@ export class GameCache {
   }
 
   async getShipCatalog(api: ApiClient): Promise<ShipClass[]> {
-    return this.getCatalogNormalized(api, "ships", "ship_catalog", normalizeShipClass);
+    // Check for stale/incomplete cache (pre-pagination-fix caches had only 20 ships)
+    const cacheKey = "ship_catalog";
+    const cached = this.cache.getStatic(cacheKey, this.gameVersion);
+    if (cached) {
+      const raw = JSON.parse(cached) as Array<Record<string, unknown>>;
+      if (raw.length >= 50) return raw.map(normalizeShipClass);
+      console.log(`[Cache] Ship catalog only has ${raw.length} ships, re-fetching...`);
+    }
+
+    const raw = await this.fetchAllCatalogPages(api, "ships");
+    const normalized = raw.map(normalizeShipClass);
+    this.cache.setStatic(cacheKey, JSON.stringify(normalized), this.gameVersion);
+    console.log(`[Cache] Cached ${normalized.length} ships`);
+    return normalized;
   }
 
   async getSkillTree(api: ApiClient): Promise<Skill[]> {
@@ -225,6 +240,7 @@ export class GameCache {
   setMarketPrices(stationId: string, prices: MarketPrice[], tick: number, ttlMs = 1_800_000): void {
     this.cache.setTimed(`market:${stationId}`, JSON.stringify(prices), ttlMs);
     this.marketFetchedAt.set(stationId, Date.now());
+    this.marketDirty = true;
 
     // Also log to market history for training data
     this.logger.logMarketPrices(
@@ -262,8 +278,8 @@ export class GameCache {
 
   // ── Market Freshness ──
 
-  /** Get freshness info for a station's market data */
-  getMarketFreshness(stationId: string, ttlMs = 300_000): MarketFreshness {
+  /** Get freshness info for a station's market data (default 15min TTL) */
+  getMarketFreshness(stationId: string, ttlMs = 900_000): MarketFreshness {
     const fetchedAt = this.marketFetchedAt.get(stationId) ?? 0;
     const ageMs = fetchedAt > 0 ? Date.now() - fetchedAt : Infinity;
     return {
@@ -274,8 +290,8 @@ export class GameCache {
     };
   }
 
-  /** Get freshness for all tracked stations */
-  getAllMarketFreshness(ttlMs = 300_000): MarketFreshness[] {
+  /** Get freshness for all tracked stations (default 15min TTL) */
+  getAllMarketFreshness(ttlMs = 900_000): MarketFreshness[] {
     const result: MarketFreshness[] = [];
     for (const stationId of this.marketFetchedAt.keys()) {
       result.push(this.getMarketFreshness(stationId, ttlMs));

@@ -312,8 +312,8 @@ describe("Routine Helpers", () => {
   describe("interruptibleSleep", () => {
     test("sleeps for duration", async () => {
       const start = Date.now();
-      await interruptibleSleep(ctx, 50);
-      expect(Date.now() - start).toBeGreaterThanOrEqual(40);
+      await interruptibleSleep(ctx, 1500);
+      expect(Date.now() - start).toBeGreaterThanOrEqual(1400);
     });
 
     test("interrupts when shouldStop", async () => {
@@ -321,7 +321,7 @@ describe("Routine Helpers", () => {
       const start = Date.now();
       const completed = await interruptibleSleep(ctx, 5000);
       expect(completed).toBe(false);
-      expect(Date.now() - start).toBeLessThan(1000);
+      expect(Date.now() - start).toBeLessThan(2000); // 1s polling interval + tolerance
     });
   });
 });

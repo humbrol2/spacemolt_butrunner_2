@@ -386,11 +386,13 @@ export async function ensureFuelSafety(ctx: BotContext): Promise<void> {
       const stillNeed = FUEL_CELL_RESERVE - ctx.cargo.getItemQuantity(ctx.ship, "fuel_cell");
       if (!gotFromFaction || stillNeed > 0) {
         const orders = await ctx.api.viewMarket();
+        const MAX_FUEL_CELL_PRICE = 300; // Fuel cells are craftable cheaply — don't overpay
         const fuelOrders = orders.filter(
           (o) =>
             o.type === "sell" &&
             o.quantity > 0 &&
-            (o.itemId.includes("fuel") || o.itemName.toLowerCase().includes("fuel"))
+            o.priceEach <= MAX_FUEL_CELL_PRICE &&
+            (o.itemId === "fuel_cell" || o.itemId === "comp_fuel_tank" || o.itemId === "fuel_cell_premium")
         );
         if (fuelOrders.length > 0) {
           fuelOrders.sort((a, b) => a.priceEach - b.priceEach);
@@ -403,6 +405,8 @@ export async function ensureFuelSafety(ctx: BotContext): Promise<void> {
             await ctx.refreshState();
             log(ctx, `bought ${buyQty}x ${best.itemId} fuel cells @ ${best.priceEach}cr`);
           }
+        } else {
+          log(ctx, `fuel cells too expensive or unavailable — crafters should produce them`);
         }
       }
     }
@@ -696,10 +700,14 @@ export async function* mineUntilFull(
   ctx: BotContext,
   targetOre?: string
 ): AsyncGenerator<string, MiningYield | null, void> {
+  let mineCount = 0;
   while (!ctx.shouldStop && ctx.cargo.hasSpace(ctx.ship, 1)) {
     try {
       const result = await ctx.api.mine();
-      await ctx.refreshState();
+      mineCount++;
+      if (mineCount % 5 === 0 || result.quantity === 0 || result.remaining === 0) {
+        await ctx.refreshState();
+      }
 
       if (result.quantity === 0 || result.remaining === 0) {
         yield `resource depleted`;
@@ -712,6 +720,7 @@ export async function* mineUntilFull(
       return null;
     }
   }
+  if (mineCount > 0) await ctx.refreshState();
 
   yield "cargo full";
   return null;
@@ -802,6 +811,7 @@ export function recordSellResult(
 export function adjustMarketCache(
   ctx: BotContext, stationId: string, itemId: string,
   action: "buy" | "sell", quantity: number,
+  opts?: { zeroDemand?: boolean },
 ): void {
   if (!stationId || !itemId || quantity <= 0) return;
   const prices = ctx.cache.getMarketPrices(stationId);
@@ -816,6 +826,11 @@ export function adjustMarketCache(
   } else {
     // We sold into buy orders → less demand available
     entry.sellVolume = Math.max(0, entry.sellVolume - quantity);
+    // Zero out sell price when confirmed no demand (prevents stale arbitrage rediscovery)
+    if (opts?.zeroDemand) {
+      entry.sellPrice = 0;
+      entry.sellVolume = 0;
+    }
   }
 
   ctx.cache.setMarketPrices(stationId, prices, Math.floor(Date.now() / 1000));
@@ -836,9 +851,104 @@ export async function interruptibleSleep(ctx: BotContext, ms: number): Promise<b
   const start = Date.now();
   while (Date.now() - start < ms) {
     if (ctx.shouldStop) return false;
-    await new Promise((r) => setTimeout(r, Math.min(100, ms - (Date.now() - start))));
+    await new Promise((r) => setTimeout(r, Math.min(1000, ms - (Date.now() - start))));
   }
   return true;
+}
+
+// ── Module Equipment ──
+
+/**
+ * Equip/unequip modules for a routine. Handles docking if needed, withdraws from
+ * faction storage, and yields progress messages. Caches faction storage lookup.
+ *
+ * Returns an async generator of status messages (yields).
+ */
+export async function* equipModulesForRoutine(
+  ctx: BotContext,
+  equipModules: string[],
+  unequipModules: string[] = [],
+): AsyncGenerator<string, void, void> {
+  if (equipModules.length === 0 && unequipModules.length === 0) return;
+
+  // Dock if not already docked
+  const wasDocked = !!ctx.player.dockedAtBase;
+  if (!wasDocked) {
+    try {
+      await findAndDock(ctx);
+    } catch {
+      yield "could not dock for module equip — continuing without";
+      return;
+    }
+  }
+
+  // Unequip modules that aren't needed
+  for (const modId of unequipModules) {
+    if (ctx.shouldStop) return;
+    try {
+      await ctx.api.uninstallMod(modId);
+      await ctx.refreshState();
+      yield `unequipped ${modId}`;
+    } catch (err) {
+      yield `unequip ${modId} failed: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  // Equip modules — single faction storage fetch for all lookups
+  let factionStorage: Array<{ itemId: string; quantity: number }> | null = null;
+  for (const modPattern of equipModules) {
+    if (ctx.shouldStop) return;
+    // Already equipped?
+    if (ctx.ship.modules.some((m) => m.moduleId.includes(modPattern))) continue;
+    // Check cargo first
+    const inCargo = ctx.ship.cargo.find((c) => c.itemId.includes(modPattern));
+    if (inCargo) {
+      try {
+        await ctx.api.installMod(inCargo.itemId);
+        await ctx.refreshState();
+        yield `equipped ${inCargo.itemId} from cargo`;
+        continue;
+      } catch (err) {
+        yield `equip ${inCargo.itemId} failed: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
+    // Withdraw from faction storage (cached lookup)
+    try {
+      if (!factionStorage) {
+        factionStorage = await ctx.api.viewFactionStorage() ?? [];
+      }
+      const mod = factionStorage.find((s) => s.itemId.includes(modPattern) && s.quantity > 0);
+      if (mod) {
+        await ctx.api.factionWithdrawItems(mod.itemId, 1);
+        await ctx.refreshState();
+        // Decrement cached quantity
+        mod.quantity--;
+        yield `withdrew ${mod.itemId} from faction storage`;
+        try {
+          await ctx.api.installMod(mod.itemId);
+          await ctx.refreshState();
+          yield `equipped ${mod.itemId}`;
+        } catch (err) {
+          yield `equip ${mod.itemId} failed: ${err instanceof Error ? err.message : String(err)}`;
+          // Deposit it back
+          try {
+            await ctx.api.factionDepositItems(mod.itemId, 1);
+            await ctx.refreshState();
+          } catch { /* best effort */ }
+        }
+      } else {
+        yield `no ${modPattern} in faction storage — continuing without`;
+      }
+    } catch (err) {
+      yield `module withdraw failed: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  // Undock if we docked just for equipping
+  if (!wasDocked && ctx.player.dockedAtBase) {
+    await ctx.api.undock();
+    await ctx.refreshState();
+  }
 }
 
 // ── Faction Treasury ──

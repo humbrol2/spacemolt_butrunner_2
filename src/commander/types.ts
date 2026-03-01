@@ -43,6 +43,8 @@ export interface WorldContext {
   galaxyLoaded: boolean;
   /** Ranked trade routes from fresh market data (for trader assignment deconfliction) */
   tradeRoutes: TradeRoute[];
+  /** All station IDs with cached market data (for per-bot arbitrage) */
+  cachedStationIds: string[];
   /** Ratio of fresh vs total known stations (0-1). Lower = more stale data. */
   dataFreshnessRatio: number;
 }
@@ -167,6 +169,7 @@ export interface StrategyWeights {
   return_home: number;
   scout: number;
   quartermaster: number;
+  scavenger: number;
   ship_upgrade: number;
 }
 

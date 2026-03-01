@@ -17,7 +17,7 @@ import type { ShipClass } from "../types/game";
 import type { CommanderBrain, EvaluationOutput, Assignment, WorldContext, PendingUpgrade } from "./types";
 import { EconomyEngine } from "./economy-engine";
 import { ScoringBrain, type ScoringConfig } from "./scoring-brain";
-import { findBestUpgrade, calculateROI, scoreShipForRole } from "../core/ship-fitness";
+import { findBestUpgrade, calculateROI, scoreShipForRole, LEGACY_SHIPS } from "../core/ship-fitness";
 
 export interface CommanderConfig {
   /** Evaluation interval in seconds */
@@ -59,8 +59,12 @@ export class Commander {
   private decisionHistory: CommanderDecision[] = [];
   private maxHistorySize = 100;
   private lastShipCheck = 0;
+  private lastFactionPoll = 0;
+  private cachedTradeRoutes: { routes: import("../core/market").TradeRoute[]; at: number } | null = null;
   /** Ship classes that failed to be found at any shipyard — blacklisted with cooldown */
   private shipBlacklist = new Map<string, number>(); // classId → blacklisted until timestamp
+  /** Bots that recently failed a ship upgrade — cooldown before re-queueing any upgrade */
+  private botUpgradeCooldown = new Map<string, number>(); // botId → cooldown until timestamp
 
   constructor(
     private config: CommanderConfig,
@@ -74,6 +78,7 @@ export class Commander {
     scoringBrain.defaultStorageMode = deps.defaultStorageMode ?? "sell";
     scoringBrain.crafting = deps.crafting;
     scoringBrain.galaxy = deps.galaxy;
+    scoringBrain.market = deps.market;
     scoringBrain.minBotCredits = deps.minBotCredits ?? 0;
     this.brain = brain ?? scoringBrain;
     this.economy = new EconomyEngine();
@@ -98,6 +103,11 @@ export class Commander {
       this.goals[index] = goal;
       this.goals.sort((a, b) => b.priority - a.priority);
     }
+  }
+
+  /** Seed faction inventory into economy engine (for startup) */
+  seedFactionInventory(items: Map<string, number>): void {
+    this.economy.updateFactionInventory(items);
   }
 
   /** Remove goal by index */
@@ -219,10 +229,17 @@ export class Commander {
     // Step 5: Build conversational thoughts
     const thoughts = this.buildThoughts(fleet, world, output);
 
-    // Step 5: Execute assignments
+    // Step 5: Execute assignments — skip bots already running the same routine
     const executedAssignments: FleetAssignment[] = [];
+    const botStatusMap = new Map(fleet.bots.map((b) => [b.botId, b]));
 
     for (const assignment of output.assignments) {
+      // Skip re-assigning a bot that's already running this exact routine
+      const botInfo = botStatusMap.get(assignment.botId);
+      if (botInfo && botInfo.routine === assignment.routine && botInfo.status === "running") {
+        continue; // Already doing this — don't interrupt
+      }
+
       try {
         await this.deps.assignRoutine(
           assignment.botId,
@@ -262,8 +279,11 @@ export class Commander {
     return decision;
   }
 
-  /** Poll faction storage inventory (best-effort, non-blocking) */
+  /** Poll faction storage inventory (best-effort, non-blocking, max every 3 minutes) */
   private async pollFactionStorage(): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastFactionPoll < 180_000) return; // Only poll every 3 minutes
+
     const api = this.deps.getApi?.();
     if (!api) return;
 
@@ -271,6 +291,7 @@ export class Commander {
     const mode = this.deps.defaultStorageMode;
     if (mode !== "faction_deposit") return;
 
+    this.lastFactionPoll = now;
     try {
       const items = await api.viewFactionStorage();
       const inventory = new Map<string, number>();
@@ -280,8 +301,10 @@ export class Commander {
         }
       }
       this.economy.updateFactionInventory(inventory);
-    } catch {
-      // Non-critical - faction storage may not be accessible
+      const oreCount = [...inventory.entries()].filter(([id]) => id.includes("ore")).reduce((s, [, q]) => s + q, 0);
+      console.log(`[Commander] Faction storage polled: ${inventory.size} item types, ${oreCount} ore units`);
+    } catch (err) {
+      console.log(`[Commander] Faction storage poll failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -302,6 +325,10 @@ export class Commander {
     for (const [classId, until] of this.shipBlacklist) {
       if (now > until) this.shipBlacklist.delete(classId);
     }
+    // Expire old per-bot upgrade cooldowns
+    for (const [botId, until] of this.botUpgradeCooldown) {
+      if (now > until) this.botUpgradeCooldown.delete(botId);
+    }
 
     // Clear stale pending upgrades for bots that already completed or failed upgrading
     for (const [botId, pending] of brain.pendingUpgrades) {
@@ -315,14 +342,16 @@ export class Commander {
         brain.pendingUpgrades.delete(botId);
         continue;
       }
-      // If bot rapid-completed ship_upgrade, the target wasn't available — blacklist it
+      // If bot rapid-completed ship_upgrade, the target wasn't available — blacklist it + cooldown the bot
       if (bot.routine !== "ship_upgrade" && bot.rapidRoutines.has("ship_upgrade") && !pending.alreadyOwned) {
         const rapidTime = bot.rapidRoutines.get("ship_upgrade")!;
         if (now - rapidTime < 300_000) { // Rapid failure within 5 minutes
           if (!this.shipBlacklist.has(pending.targetShipClass)) {
-            this.shipBlacklist.set(pending.targetShipClass, now + 1_800_000); // Blacklist for 30 min
+            this.shipBlacklist.set(pending.targetShipClass, now + 1_800_000); // Blacklist ship for 30 min
             console.log(`[Commander] Blacklisted ${pending.targetShipClass} — not available at any visited shipyard (30min cooldown)`);
           }
+          // Per-bot cooldown: don't try ANY upgrade for this bot for 30 min
+          this.botUpgradeCooldown.set(botId, now + 1_800_000);
           brain.pendingUpgrades.delete(botId);
         }
       }
@@ -332,9 +361,11 @@ export class Commander {
       if (bot.status !== "ready" && bot.status !== "running") continue;
       if (bot.routine === "ship_upgrade") continue; // Already upgrading
       if (brain.pendingUpgrades.has(bot.botId)) continue; // Already queued
+      if (this.botUpgradeCooldown.has(bot.botId)) continue; // Recently failed — on cooldown
 
       const role = bot.routine ?? "default";
-      const currentClass = catalog.find((s) => s.id === bot.shipClass);
+      const currentClass = catalog.find((s) => s.id === bot.shipClass)
+        ?? LEGACY_SHIPS.find((s) => s.id === bot.shipClass);
       if (!currentClass) continue;
 
       // Priority 1: Check if bot already owns a better ship (free switch, no purchase)
@@ -345,7 +376,8 @@ export class Commander {
 
         for (const owned of bot.ownedShips) {
           if (owned.classId === bot.shipClass) continue; // Skip current ship
-          const ownedShipClass = catalog.find((s) => s.id === owned.classId);
+          const ownedShipClass = catalog.find((s) => s.id === owned.classId)
+            ?? LEGACY_SHIPS.find((s) => s.id === owned.classId);
           if (!ownedShipClass) continue;
           const score = scoreShipForRole(ownedShipClass, role);
           if (score > bestOwnedScore + 3) { // Must be noticeably better
@@ -459,11 +491,19 @@ export class Commander {
       }
     }
 
-    // Trade routes from ALL cached market data (not just fresh — stale data is still useful for routing)
+    // Trade routes from ALL cached market data (cached 3 min, invalidated by market changes)
     const allCachedStationIds = cache.getAllMarketFreshness().map((f) => f.stationId);
-    const tradeRoutes = allCachedStationIds.length >= 2
-      ? market.findArbitrage(allCachedStationIds, fleet.bots[0]?.systemId ?? "").slice(0, 10)
-      : [];
+    const now = Date.now();
+    if (!this.cachedTradeRoutes || now - this.cachedTradeRoutes.at > 180_000 || cache.marketDirty) {
+      // Use median fleet cargo capacity for route ranking
+      const capacities = fleet.bots.map((b) => b.cargoCapacity).filter((c) => c > 0).sort((a, b) => a - b);
+      const medianCargo = capacities.length > 0 ? capacities[Math.floor(capacities.length / 2)] : 100;
+      const routes = allCachedStationIds.length >= 2
+        ? market.findArbitrage(allCachedStationIds, fleet.bots[0]?.systemId ?? "", medianCargo).slice(0, 10)
+        : [];
+      this.cachedTradeRoutes = { routes, at: now };
+    }
+    const tradeRoutes = this.cachedTradeRoutes.routes;
 
     // Data freshness ratio: what fraction of known stations have fresh data
     const allKnownStationIds = new Set<string>();
@@ -482,6 +522,7 @@ export class Commander {
       bestTradeProfit: tradeRoutes.length > 0 ? tradeRoutes[0].tripProfitPerTick : 0,
       galaxyLoaded: galaxy.systemCount > 0,
       tradeRoutes,
+      cachedStationIds: allCachedStationIds,
       dataFreshnessRatio,
     };
   }

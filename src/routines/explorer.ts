@@ -25,6 +25,7 @@ import {
   handleEmergency,
   safetyCheck,
   getParam,
+  equipModulesForRoutine,
 } from "./helpers";
 
 /** Threshold in ms: stations with data older than this get priority */
@@ -38,81 +39,7 @@ export async function* explorer(ctx: BotContext): AsyncGenerator<string, void, v
   const equipModules = getParam<string[]>(ctx, "equipModules", []);
 
   // ── Equip modules (survey scanner) if commanded by scoring brain ──
-  if (equipModules.length > 0 && ctx.player.dockedAtBase) {
-    for (const modPattern of equipModules) {
-      if (ctx.shouldStop) return;
-      // Already equipped?
-      if (ctx.ship.modules.some((m) => m.moduleId.includes(modPattern))) continue;
-      // Check cargo
-      const inCargo = ctx.ship.cargo.find((c) => c.itemId.includes(modPattern));
-      if (inCargo) {
-        try {
-          await ctx.api.installMod(inCargo.itemId);
-          await ctx.refreshState();
-          yield `equipped ${inCargo.itemId} from cargo`;
-          continue;
-        } catch (err) {
-          yield `equip ${inCargo.itemId} failed: ${err instanceof Error ? err.message : String(err)}`;
-        }
-      }
-      // Withdraw from faction storage
-      try {
-        const storage = await ctx.api.viewFactionStorage();
-        const mod = (storage ?? []).find((s) => s.itemId.includes(modPattern) && s.quantity > 0);
-        if (mod) {
-          await ctx.api.factionWithdrawItems(mod.itemId, 1);
-          await ctx.refreshState();
-          yield `withdrew ${mod.itemId} from faction storage`;
-          try {
-            await ctx.api.installMod(mod.itemId);
-            await ctx.refreshState();
-            yield `equipped ${mod.itemId}`;
-          } catch (err) {
-            yield `equip ${mod.itemId} failed: ${err instanceof Error ? err.message : String(err)}`;
-            // Deposit it back
-            try {
-              await ctx.api.factionDepositItems(mod.itemId, 1);
-              await ctx.refreshState();
-            } catch { /* best effort */ }
-          }
-        } else {
-          yield `no ${modPattern} in faction storage — exploring without it`;
-        }
-      } catch (err) {
-        yield `module withdraw failed: ${err instanceof Error ? err.message : String(err)}`;
-      }
-    }
-  } else if (equipModules.length > 0 && !ctx.player.dockedAtBase) {
-    // Need to dock first to equip modules
-    try {
-      await findAndDock(ctx);
-      // Recurse equip logic by re-checking
-      for (const modPattern of equipModules) {
-        if (ctx.shouldStop) return;
-        if (ctx.ship.modules.some((m) => m.moduleId.includes(modPattern))) continue;
-        try {
-          const storage = await ctx.api.viewFactionStorage();
-          const mod = (storage ?? []).find((s) => s.itemId.includes(modPattern) && s.quantity > 0);
-          if (mod) {
-            await ctx.api.factionWithdrawItems(mod.itemId, 1);
-            await ctx.refreshState();
-            await ctx.api.installMod(mod.itemId);
-            await ctx.refreshState();
-            yield `equipped ${mod.itemId}`;
-          }
-        } catch (err) {
-          yield `equip failed: ${err instanceof Error ? err.message : String(err)}`;
-        }
-      }
-      // Undock after equipping
-      if (ctx.player.dockedAtBase) {
-        await ctx.api.undock();
-        await ctx.refreshState();
-      }
-    } catch {
-      yield "could not dock for module equip — continuing without";
-    }
-  }
+  yield* equipModulesForRoutine(ctx, equipModules);
 
   // Enable cloaking if requested
   if (useCloaking) {

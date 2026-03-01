@@ -37,6 +37,52 @@ import {
   interruptibleSleep,
 } from "./helpers";
 
+/** Resolve current station name for chat messages */
+function getStationName(ctx: BotContext): string {
+  const baseId = ctx.player.dockedAtBase;
+  if (!baseId) return "";
+  const systemId = ctx.galaxy.getSystemForBase(baseId);
+  if (!systemId) return baseId;
+  const sys = ctx.galaxy.getSystem(systemId);
+  const poi = sys?.pois.find((p) => p.baseId === baseId);
+  return poi?.baseName ?? poi?.name ?? baseId;
+}
+
+/**
+ * Find an alternate station to sell cargo at, using cached market data.
+ * Scores stations by total expected revenue for items currently in cargo,
+ * skipping the failed station. Returns the best reachable station base ID or null.
+ */
+function findAlternateBuyer(ctx: BotContext, failedStation: string): string | null {
+  const cargoItems = ctx.ship.cargo.filter((c) => c.itemId !== "fuel_cell" && c.quantity > 0);
+  if (cargoItems.length === 0) return null;
+
+  const freshStations = ctx.cache.getAllMarketFreshness();
+  let bestStation = "";
+  let bestRevenue = 0;
+
+  for (const { stationId } of freshStations) {
+    if (stationId === failedStation) continue;
+    const prices = ctx.cache.getMarketPrices(stationId);
+    if (!prices) continue;
+
+    let revenue = 0;
+    for (const cargo of cargoItems) {
+      const price = prices.find((p) => p.itemId === cargo.itemId);
+      if (price?.sellPrice && price.sellPrice > 0) {
+        revenue += price.sellPrice * cargo.quantity;
+      }
+    }
+
+    if (revenue > bestRevenue) {
+      bestRevenue = revenue;
+      bestStation = stationId;
+    }
+  }
+
+  return bestStation || null;
+}
+
 export async function* trader(ctx: BotContext): AsyncGenerator<string, void, void> {
   let buyStation = getParam(ctx, "buyStation", "");
   let sellStation = getParam(ctx, "sellStation", "");
@@ -72,20 +118,31 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
           .filter((s: { itemId: string; quantity: number }) => s.quantity > 0 && !s.itemId.startsWith("ore_"));
 
         if (sellableItems.length > 0) {
-          // Check if any faction item has confirmed sell demand at a cached station
+          // Check if faction goods have enough total value to justify a sell trip
           const cachedStationIds = ctx.cache.getAllMarketFreshness().map((f) => f.stationId);
+          let bestTotalValue = 0;
+          let bestItemName = "";
+          let bestItemQty = 0;
+          let bestItemPrice = 0;
           for (const si of sellableItems) {
             for (const stationId of cachedStationIds) {
               if (stationId === factionStation) continue;
               const prices = ctx.cache.getMarketPrices(stationId);
               const sellPrice = prices?.find((p) => p.itemId === si.itemId)?.sellPrice ?? 0;
-              if (sellPrice > 0) {
-                const itemName = ctx.crafting.getItemName(si.itemId);
-                yield `faction has ${si.quantity} ${itemName} sellable @${sellPrice}cr — selling free goods first`;
-                yield* factionSellLoop(ctx, maxRoundTrips);
-                return;
+              const totalValue = sellPrice * si.quantity;
+              if (totalValue > bestTotalValue) {
+                bestTotalValue = totalValue;
+                bestItemName = ctx.crafting.getItemName(si.itemId);
+                bestItemQty = si.quantity;
+                bestItemPrice = sellPrice;
               }
             }
+          }
+          // Only divert to faction sell if total value justifies the trip (>500cr)
+          if (bestTotalValue >= 500) {
+            yield `faction has ${bestItemQty} ${bestItemName} sellable @${bestItemPrice}cr (~${bestTotalValue}cr total) — selling free goods first`;
+            yield* factionSellLoop(ctx, maxRoundTrips);
+            return;
           }
         }
       } catch {
@@ -104,7 +161,7 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
     // Use Commander's cached market data to find arbitrage
     const cachedStationIds = ctx.cache.getAllMarketFreshness().map((f) => f.stationId);
     if (cachedStationIds.length >= 2) {
-      const routes = ctx.market.findArbitrage(cachedStationIds, ctx.player.currentSystem)
+      const routes = ctx.market.findArbitrage(cachedStationIds, ctx.player.currentSystem, ctx.cargo.freeSpace(ctx.ship))
         .filter((r) => !r.itemId.startsWith("ore_")); // Traders don't trade ores
       for (const r of routes) {
         candidateRoutes.push({
@@ -340,7 +397,9 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
         // Weight-aware: divide free cargo weight by per-unit size
         let buyQty = Math.floor(freeWeight / Math.max(1, itemSize));
         if (bestPrice > 0) {
-          const maxByCredits = Math.floor(ctx.player.credits / bestPrice);
+          // Spend cap: don't risk more than 50% of credits on a single trade
+          const spendCap = Math.floor(ctx.player.credits * 0.50);
+          const maxByCredits = Math.floor(spendCap / bestPrice);
           buyQty = Math.min(buyQty, maxByCredits, availableQty || buyQty);
         }
         // Cap by known sell demand volume — don't buy more than we can sell
@@ -362,6 +421,7 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
               } else {
                 await ctx.api.createBuyOrder(item, buyQty, orderPrice);
                 yield `buy order placed: ${buyQty}x @ ${orderPrice}cr`;
+                try { const stn = getStationName(ctx); await ctx.api.chat("system", `Buying ${buyQty}x ${item} @ ${orderPrice}cr${stn ? ` at ${stn}` : ""}`); } catch { /* best effort */ }
               }
             } else {
               const cargoBefore = ctx.cargo.getItemQuantity(ctx.ship, item);
@@ -394,31 +454,104 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
     // ── Navigate to sell station ──
     const cargoQty = ctx.cargo.getItemQuantity(ctx.ship, item);
     if (cargoQty === 0) {
-      // Try next candidate route before giving up
-      routeIndex++;
-      if (routeIndex < candidateRoutes.length) {
-        const next = candidateRoutes[routeIndex];
-        yield `route ${routeIndex}/${candidateRoutes.length} unprofitable, trying next: ${next.itemName} (+${next.profitPerUnit}cr/unit)`;
-        item = next.itemId;
-        buyStation = next.buyStation;
-        sellStation = next.sellStation;
-        maxBuyPrice = next.buyPrice;
-        minSellPrice = next.sellPrice * 0.9;
-        continue; // Re-enter loop with new route
+      // Opportunistic buy: we're already at this station, scan for anything profitable here
+      if (ctx.player.dockedAtBase) {
+        const localMarket = await ctx.api.viewMarket();
+        if (localMarket.length > 0) {
+          cacheMarketData(ctx, ctx.player.dockedAtBase, localMarket);
+          const cachedStationIds = ctx.cache.getAllMarketFreshness().map((f) => f.stationId);
+          const freeWeight = ctx.cargo.freeSpace(ctx.ship);
+          // Find anything here we can buy profitably
+          for (const order of localMarket.filter((m) => m.type === "sell" && m.quantity > 0 && m.priceEach > 0 && !m.itemId.startsWith("ore_"))) {
+            for (const sid of cachedStationIds) {
+              if (sid === ctx.player.dockedAtBase) continue;
+              const prices = ctx.cache.getMarketPrices(sid);
+              const sellData = prices?.find((p) => p.itemId === order.itemId);
+              if (sellData?.sellPrice && sellData.sellPrice > order.priceEach) {
+                const profit = sellData.sellPrice - order.priceEach;
+                const itemSize = ctx.cargo.getItemSize(ctx.ship, order.itemId);
+                const spendCap = Math.floor(ctx.player.credits * 0.50);
+                const maxQty = Math.min(
+                  Math.floor(freeWeight / Math.max(1, itemSize)),
+                  Math.floor(spendCap / order.priceEach),
+                  order.quantity,
+                );
+                if (maxQty > 0 && profit * maxQty > 100) { // Only if total profit > 100cr
+                  yield `opportunistic: buying ${maxQty} ${order.itemName ?? order.itemId} (+${profit}cr/unit)`;
+                  try {
+                    await ctx.api.buy(order.itemId, maxQty);
+                    await ctx.refreshState();
+                    item = order.itemId;
+                    sellStation = sid;
+                    lastBuyPrice = order.priceEach;
+                    break;
+                  } catch { /* continue looking */ }
+                }
+              }
+            }
+            if (ctx.cargo.getItemQuantity(ctx.ship, item) > 0) break;
+          }
+        }
       }
-      yield "no profitable routes found — waiting for new opportunities";
-      await refuelIfNeeded(ctx);
-      await interruptibleSleep(ctx, 120_000);
-      yield "cycle_complete";
-      return;
+
+      // If opportunistic buy didn't land anything, try next candidate route
+      if (ctx.cargo.getItemQuantity(ctx.ship, item) === 0) {
+        routeIndex++;
+        if (routeIndex < candidateRoutes.length) {
+          const next = candidateRoutes[routeIndex];
+          yield `route ${routeIndex}/${candidateRoutes.length} unprofitable, trying next: ${next.itemName} (+${next.profitPerUnit}cr/unit)`;
+          item = next.itemId;
+          buyStation = next.buyStation;
+          sellStation = next.sellStation;
+          maxBuyPrice = next.buyPrice;
+          minSellPrice = next.sellPrice * 0.9;
+          continue; // Re-enter loop with new route
+        }
+        yield "no profitable routes found — waiting for new opportunities";
+        await refuelIfNeeded(ctx);
+        await interruptibleSleep(ctx, 120_000);
+        yield "cycle_complete";
+        return;
+      }
     }
 
     yield "traveling to sell station";
     try {
       await navigateAndDock(ctx, sellStation);
     } catch (err) {
-      yield `navigation failed: ${err instanceof Error ? err.message : String(err)}`;
-      return;
+      yield `navigation to sell station failed: ${err instanceof Error ? err.message : String(err)}`;
+      // Find an alternate buyer from cached market data
+      const altStation = findAlternateBuyer(ctx, sellStation);
+      if (altStation) {
+        yield `rerouting to alternate buyer: ${altStation}`;
+        try {
+          await navigateAndDock(ctx, altStation);
+          // Fall through to normal sell logic below with the new station
+          sellStation = altStation;
+        } catch (altErr) {
+          yield `alternate route also failed: ${altErr instanceof Error ? altErr.message : String(altErr)}`;
+          // Last resort: sell at nearest reachable station
+          try {
+            await findAndDock(ctx);
+            await sellAllCargo(ctx);
+            await ctx.refreshState();
+            yield "sold cargo at nearest station";
+          } catch { yield "all sell attempts failed — cargo stranded"; }
+          yield "cycle_complete";
+          return;
+        }
+      } else {
+        // No cached alternate — sell at nearest station
+        yield "no alternate buyers known — selling at nearest station";
+        try {
+          await findAndDock(ctx);
+          await sellAllCargo(ctx);
+          await ctx.refreshState();
+          yield "sold cargo at fallback station";
+        } catch { yield "fallback sell failed — cargo stranded"; }
+        yield "cycle_complete";
+        return;
+      }
     }
 
     if (ctx.shouldStop) return;
@@ -499,6 +632,7 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
             if (orderPrice) {
               await ctx.api.createSellOrder(item, qty, orderPrice);
               yield `sell order placed: ${qty}x @ ${orderPrice}cr`;
+              try { const stn = getStationName(ctx); await ctx.api.chat("system", `Selling ${qty}x ${item} @ ${orderPrice}cr${stn ? ` at ${stn}` : ""}`); } catch { /* best effort */ }
             } else {
               const result = await ctx.api.sell(item, qty);
               await ctx.refreshState();
@@ -518,8 +652,8 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
             if (!actuallySold && result.priceEach === 0 && result.total === 0) {
               yield `no demand for ${item} at this station`;
 
-              // Invalidate cached sell price so we don't route here again
-              adjustMarketCache(ctx, sellStation, item, "sell", qty);
+              // Zero out cached sell price so arbitrage won't rediscover this route
+              adjustMarketCache(ctx, sellStation, item, "sell", qty, { zeroDemand: true });
 
               // Try other stations with cached demand before dumping
               const remainingQty = ctx.cargo.getItemQuantity(ctx.ship, item);
@@ -598,6 +732,57 @@ export async function* trader(ctx: BotContext): AsyncGenerator<string, void, voi
           }
         } catch {
           // Non-critical — some items may not be sellable here
+        }
+      }
+    }
+
+    // ── Multi-hop: buy something here for the return trip ──
+    if (!ctx.shouldStop && ctx.player.dockedAtBase && ctx.cargo.freeSpace(ctx.ship) > 0) {
+      const returnMarket = await ctx.api.viewMarket();
+      if (returnMarket.length > 0) {
+        cacheMarketData(ctx, sellStation, returnMarket);
+        // Check if anything here sells for more at the buy station (or any known station)
+        const freeWeight = ctx.cargo.freeSpace(ctx.ship);
+        const cachedStations = ctx.cache.getAllMarketFreshness().map((f) => f.stationId);
+        let bestReturnItem: { itemId: string; buyPrice: number; sellPrice: number; targetStation: string; qty: number; name: string } | null = null;
+        let bestReturnProfit = 0;
+        for (const order of returnMarket.filter((m) => m.type === "sell" && m.quantity > 0 && m.priceEach > 0 && !m.itemId.startsWith("ore_"))) {
+          for (const sid of cachedStations) {
+            if (sid === sellStation) continue;
+            const prices = ctx.cache.getMarketPrices(sid);
+            const sellData = prices?.find((p) => p.itemId === order.itemId);
+            if (sellData?.sellPrice && sellData.sellPrice > order.priceEach) {
+              const profitPerUnit = sellData.sellPrice - order.priceEach;
+              const itemSize = ctx.cargo.getItemSize(ctx.ship, order.itemId);
+              const returnSpendCap = Math.floor(ctx.player.credits * 0.50);
+              const maxQty = Math.min(
+                Math.floor(freeWeight / Math.max(1, itemSize)),
+                Math.floor(returnSpendCap / order.priceEach),
+                order.quantity,
+              );
+              const totalProfit = profitPerUnit * maxQty;
+              if (totalProfit > bestReturnProfit && totalProfit > 100) {
+                bestReturnProfit = totalProfit;
+                bestReturnItem = { itemId: order.itemId, buyPrice: order.priceEach, sellPrice: sellData.sellPrice, targetStation: sid, qty: maxQty, name: order.itemName ?? order.itemId };
+              }
+            }
+          }
+        }
+        if (bestReturnItem) {
+          yield `multi-hop: buying ${bestReturnItem.qty} ${bestReturnItem.name} (+${bestReturnItem.sellPrice - bestReturnItem.buyPrice}cr/unit) for return trip`;
+          try {
+            await ctx.api.buy(bestReturnItem.itemId, bestReturnItem.qty);
+            await ctx.refreshState();
+            // Set up for next iteration to sell at the target station
+            item = bestReturnItem.itemId;
+            buyStation = sellStation;
+            sellStation = bestReturnItem.targetStation;
+            lastBuyPrice = bestReturnItem.buyPrice;
+            maxBuyPrice = bestReturnItem.buyPrice;
+            minSellPrice = bestReturnItem.sellPrice * 0.9;
+          } catch (err) {
+            yield `return buy failed: ${err instanceof Error ? err.message : String(err)}`;
+          }
         }
       }
     }
@@ -686,44 +871,97 @@ async function* factionSellLoop(
       continue;
     }
 
-    // Rank items by value (catalog price or cached market price as fallback)
-    // Skip raw ores — those are for crafters
+    // ── Pre-select sell station BEFORE withdrawing ──
+    // Only consider items with KNOWN buyers (cached sellPrice > 0 at some station).
+    // This prevents blind withdrawals that end up re-deposited.
     const cachedStations = ctx.cache.getAllMarketFreshness().map((f) => f.stationId);
-    const sellable = storageItems
-      .filter((s) => !s.itemId.startsWith("ore_"))
-      .map((s) => {
-        let bestPrice = ctx.crafting.getItemBasePrice(s.itemId);
-        // Fallback: check cached market data for actual sell prices
-        if (bestPrice <= 0) {
-          for (const sid of cachedStations) {
-            const prices = ctx.cache.getMarketPrices(sid);
-            const sellPrice = prices?.find((p) => p.itemId === s.itemId)?.sellPrice ?? 0;
-            if (sellPrice > bestPrice) bestPrice = sellPrice;
-          }
-        }
-        return {
-          ...s,
-          basePrice: bestPrice,
-          name: ctx.crafting.getItemName(s.itemId),
-        };
-      })
-      .filter((s) => s.basePrice > 0)
-      .sort((a, b) => (b.basePrice * b.quantity) - (a.basePrice * a.quantity)); // Total value
+    const nonOreStorage = storageItems.filter((s) => !s.itemId.startsWith("ore_") && s.quantity > 0);
 
-    if (sellable.length === 0) {
-      yield "no sellable items in faction storage (only ores) — waiting";
-      await interruptibleSleep(ctx, 120_000);
+    // Build a ranked list of stations by total revenue for items in storage
+    const stationBids: Array<{
+      stationId: string;
+      revenue: number;
+      jumps: number;
+      items: Array<{ itemId: string; name: string; qty: number; price: number }>;
+    }> = [];
+
+    for (const stationId of cachedStations) {
+      if (stationId === factionStation) continue;
+      const prices = ctx.cache.getMarketPrices(stationId);
+      if (!prices) continue;
+      const sellSystemId = ctx.galaxy.getSystemForBase(stationId);
+      const jumps = sellSystemId ? ctx.galaxy.getDistance(ctx.player.currentSystem, sellSystemId) : -1;
+      if (jumps < 0) continue;
+
+      const stationItems: typeof stationBids[0]["items"] = [];
+      let revenue = 0;
+      for (const si of nonOreStorage) {
+        const priceData = prices.find((p) => p.itemId === si.itemId);
+        if (priceData?.sellPrice && priceData.sellPrice > 0) {
+          const qty = si.quantity;
+          const total = priceData.sellPrice * qty;
+          revenue += total;
+          stationItems.push({ itemId: si.itemId, name: ctx.crafting.getItemName(si.itemId), qty, price: priceData.sellPrice });
+        }
+      }
+
+      if (revenue <= 0) continue;
+      const fuelCost = jumps * 2 * 15;
+      const netRevenue = revenue - fuelCost;
+      if (netRevenue >= 200) { // Minimum trip profit
+        stationBids.push({ stationId, revenue: netRevenue, jumps, items: stationItems });
+      }
+    }
+
+    stationBids.sort((a, b) => b.revenue - a.revenue);
+
+    if (stationBids.length === 0) {
+      yield "no known buyers for faction goods — waiting for market data";
+      await interruptibleSleep(ctx, 300_000);
       yield "cycle_complete";
       continue;
     }
 
-    // ── Withdraw the most valuable item(s) ──
-    let withdrawnItem = "";
-    let withdrawnQty = 0;
+    // Use the top bid's items as what to withdraw (only items with confirmed buyers)
+    const topBid = stationBids[0];
+    const sellable = topBid.items.map((i) => ({
+      itemId: i.itemId,
+      quantity: i.qty,
+      basePrice: i.price,
+      name: i.name,
+    }));
+
+    yield `${stationBids.length} station(s) want our goods — best: ~${topBid.revenue}cr net (${topBid.jumps} jumps)`;
+
+    // ── Free up cargo space if needed (leftover from previous routine) ──
+    if (ctx.cargo.freeSpace(ctx.ship) <= 0 && ctx.ship.cargo.length > 0 && ctx.player.dockedAtBase) {
+      yield "clearing cargo before faction withdrawal";
+      for (const c of ctx.ship.cargo) {
+        if (isProtectedItem(c.itemId)) continue;
+        // Deposit to faction storage first (free, keeps goods in supply chain)
+        try {
+          await ctx.api.factionDepositItems(c.itemId, c.quantity);
+          await ctx.refreshState();
+          yield `deposited ${c.quantity} ${c.itemId} to faction storage`;
+          continue;
+        } catch { /* try sell */ }
+        // Sell as fallback
+        try {
+          const result = await ctx.api.sell(c.itemId, c.quantity);
+          await ctx.refreshState();
+          if (result.total > 0) yield `sold ${result.quantity} ${c.itemId} @ ${result.priceEach}cr`;
+        } catch { /* skip */ }
+      }
+    }
+
+    // ── Withdraw valuable items — fill cargo with multiple types ──
+    const withdrawnItems: Array<{ itemId: string; qty: number; name: string }> = [];
 
     for (const item of sellable) {
       if (ctx.shouldStop) return;
       const freeWeight = ctx.cargo.freeSpace(ctx.ship); // Recalculate each iteration
+      if (freeWeight <= 0) break; // Cargo full
+
       const itemSize = ctx.cargo.getItemSize(ctx.ship, item.itemId);
       const maxByWeight = Math.floor(freeWeight / Math.max(1, itemSize));
       const withdrawQty = Math.min(item.quantity, maxByWeight);
@@ -731,155 +969,140 @@ async function* factionSellLoop(
       if (withdrawQty <= 0) continue;
 
       yield `withdrawing ${withdrawQty} ${item.name} from faction storage`;
+      let actualQty = withdrawQty;
       try {
         const cargoBefore = ctx.cargo.getItemQuantity(ctx.ship, item.itemId);
-        await ctx.api.factionWithdrawItems(item.itemId, withdrawQty);
+        await ctx.api.factionWithdrawItems(item.itemId, actualQty);
         await ctx.refreshState();
         const cargoAfter = ctx.cargo.getItemQuantity(ctx.ship, item.itemId);
         const actualReceived = cargoAfter - cargoBefore;
         if (actualReceived <= 0) {
-          yield `withdraw warning: cargo unchanged after withdrawing ${withdrawQty} ${item.name}`;
+          yield `withdraw warning: cargo unchanged after withdrawing ${actualQty} ${item.name}`;
           continue; // Try next item
         }
-        withdrawnItem = item.itemId;
-        withdrawnQty = actualReceived;
+        withdrawnItems.push({ itemId: item.itemId, qty: actualReceived, name: item.name });
         yield `withdrew ${actualReceived} ${item.name} (${item.basePrice}cr base value)`;
-        break; // One item type per trip
       } catch (err) {
-        yield `withdraw failed: ${err instanceof Error ? err.message : String(err)}`;
+        const msg = err instanceof Error ? err.message : String(err);
+        // cargo_full: item weighs more than 1 per unit — retry with halved qty
+        if (msg.includes("cargo_full") && actualQty > 1) {
+          actualQty = Math.max(1, Math.floor(actualQty / 2));
+          yield `retrying with ${actualQty} ${item.name} (item heavier than expected)`;
+          try {
+            const cargoBefore = ctx.cargo.getItemQuantity(ctx.ship, item.itemId);
+            await ctx.api.factionWithdrawItems(item.itemId, actualQty);
+            await ctx.refreshState();
+            const cargoAfter = ctx.cargo.getItemQuantity(ctx.ship, item.itemId);
+            const actualReceived = cargoAfter - cargoBefore;
+            if (actualReceived > 0) {
+              withdrawnItems.push({ itemId: item.itemId, qty: actualReceived, name: item.name });
+              yield `withdrew ${actualReceived} ${item.name}`;
+            }
+          } catch (retryErr) {
+            yield `retry withdraw failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`;
+          }
+        } else {
+          yield `withdraw failed: ${msg}`;
+        }
       }
     }
 
-    if (!withdrawnItem || withdrawnQty <= 0) {
+    if (withdrawnItems.length === 0) {
       yield "could not withdraw any items — waiting";
       await interruptibleSleep(ctx, 120_000);
       yield "cycle_complete";
       continue;
     }
 
-    if (ctx.shouldStop) return;
-
-    // ── Find best sell station ──
-    // Check cached market data for stations with demand for this item
-    const cachedStationIds = ctx.cache.getAllMarketFreshness().map((f) => f.stationId);
-    let targetStation = "";
-    let bestSellPrice = 0;
-
-    for (const stationId of cachedStationIds) {
-      if (stationId === factionStation) continue; // Don't sell at our own station
-      const prices = ctx.cache.getMarketPrices(stationId);
-      if (!prices) continue;
-      const priceData = prices.find((p) => p.itemId === withdrawnItem);
-      if (priceData?.sellPrice && priceData.sellPrice > bestSellPrice) {
-        bestSellPrice = priceData.sellPrice;
-        targetStation = stationId;
-      }
-    }
-
-    // Fallback: try local station ONLY if it has cached demand for this item
-    if (!targetStation) {
-      const system = await ctx.api.getSystem();
-      for (const poi of system.pois) {
-        if (!poi.hasBase || !poi.baseId || poi.baseId === factionStation) continue;
-        const prices = ctx.cache.getMarketPrices(poi.baseId);
-        const itemPrice = prices?.find((p) => p.itemId === withdrawnItem);
-        if (itemPrice?.sellPrice && itemPrice.sellPrice > 0) {
-          targetStation = poi.baseId;
-          bestSellPrice = itemPrice.sellPrice;
-          yield `found local demand: ${poi.baseName ?? poi.name} @ ${bestSellPrice}cr`;
-          break;
-        }
-      }
-      if (!targetStation) {
-        yield `no station with confirmed demand for ${ctx.crafting.getItemName(withdrawnItem)}, re-depositing`;
-        // Return items to faction storage
-        const qty = ctx.cargo.getItemQuantity(ctx.ship, withdrawnItem);
-        if (qty > 0 && ctx.player.dockedAtBase) {
-          try {
-            await ctx.api.factionDepositItems(withdrawnItem, qty);
-            await ctx.refreshState();
-            yield `re-deposited ${qty} ${ctx.crafting.getItemName(withdrawnItem)}`;
-          } catch {}
-        }
-        await refuelIfNeeded(ctx);
-        tripCount++;
-        yield "cycle_complete";
-        continue;
-      }
-    }
-
-    if (!targetStation) {
-      // Last resort: sell at current station
-      yield "no other station found, selling here";
-      try {
-        const result = await ctx.api.sell(withdrawnItem, withdrawnQty);
-        await ctx.refreshState();
-        if (result.total > 0) {
-          yield `sold ${result.quantity} ${withdrawnItem} @ ${result.priceEach}cr (total: ${result.total}cr)`;
-          recordSellResult(ctx, factionStation, withdrawnItem, withdrawnItem, result.priceEach, result.quantity);
-        } else {
-          yield `no demand for ${ctx.crafting.getItemName(withdrawnItem)} here`;
-        }
-      } catch (err) {
-        yield `sell failed: ${err instanceof Error ? err.message : String(err)}`;
-      }
-      await refuelIfNeeded(ctx);
-      tripCount++;
-      yield "cycle_complete";
-      continue;
-    }
-
-    // ── Travel to sell station ──
-    yield `selling at ${bestSellPrice > 0 ? `${bestSellPrice}cr` : "best"} station`;
-    try {
-      await navigateAndDock(ctx, targetStation);
-    } catch (err) {
-      yield `navigation failed: ${err instanceof Error ? err.message : String(err)}`;
-      // Re-deposit items if we can't reach sell station
-      const reDepositQty = ctx.cargo.getItemQuantity(ctx.ship, withdrawnItem);
-      if (reDepositQty > 0 && ctx.player.dockedAtBase) {
-        try {
-          await ctx.api.factionDepositItems(withdrawnItem, reDepositQty);
-          await ctx.refreshState();
-          yield `re-deposited ${reDepositQty} ${ctx.crafting.getItemName(withdrawnItem)}`;
-        } catch { /* best effort */ }
-      }
-      await interruptibleSleep(ctx, 60_000);
-      yield "cycle_complete";
-      continue;
+    if (withdrawnItems.length > 1) {
+      yield `loaded ${withdrawnItems.length} item types (${withdrawnItems.reduce((s, w) => s + w.qty, 0)} total units)`;
     }
 
     if (ctx.shouldStop) return;
 
-    // ── Sell ──
+    // ── Try sell stations in ranked order (best revenue first) ──
+    // If first station fails (nav error, no demand), try the next one.
+    // Only re-deposit as last resort after all known buyers exhausted.
+    let sold = false;
     const factionSellCreditsBefore = ctx.player.credits;
-    const qty = ctx.cargo.getItemQuantity(ctx.ship, withdrawnItem);
-    if (qty > 0) {
-      yield `selling ${qty} ${ctx.crafting.getItemName(withdrawnItem)}`;
+
+    for (let bidIdx = 0; bidIdx < Math.min(stationBids.length, 3); bidIdx++) {
+      if (ctx.shouldStop) return;
+      const bid = stationBids[bidIdx];
+
+      yield `trying station ${bidIdx + 1}/${Math.min(stationBids.length, 3)}: ~${bid.revenue}cr expected (${bid.jumps} jumps)`;
       try {
-        const result = await ctx.api.sell(withdrawnItem, qty);
-        await ctx.refreshState();
-        if (result.total > 0) {
-          yield `sold ${result.quantity} ${withdrawnItem} @ ${result.priceEach}cr (total: ${result.total}cr)`;
-          recordSellResult(ctx, targetStation, withdrawnItem, withdrawnItem, result.priceEach, result.quantity);
-        } else {
-          yield `no demand for ${ctx.crafting.getItemName(withdrawnItem)} at this station`;
-        }
+        await navigateAndDock(ctx, bid.stationId);
       } catch (err) {
-        yield `sell failed: ${err instanceof Error ? err.message : String(err)}`;
+        yield `navigation failed: ${err instanceof Error ? err.message : String(err)}`;
+        continue; // Try next station
+      }
+
+      // Sell all withdrawn items at this station
+      let stationSoldAny = false;
+      const withdrawnIds = new Set(withdrawnItems.map((w) => w.itemId));
+      for (const wi of withdrawnItems) {
+        const qty = ctx.cargo.getItemQuantity(ctx.ship, wi.itemId);
+        if (qty <= 0) continue;
+        yield `selling ${qty} ${wi.name}`;
+        try {
+          const result = await ctx.api.sell(wi.itemId, qty);
+          await ctx.refreshState();
+          if (result.total > 0) {
+            yield `sold ${result.quantity} ${wi.itemId} @ ${result.priceEach}cr (total: ${result.total}cr)`;
+            recordSellResult(ctx, bid.stationId, wi.itemId, wi.itemId, result.priceEach, result.quantity);
+            stationSoldAny = true;
+          } else {
+            yield `no demand for ${wi.name} at this station`;
+          }
+        } catch (err) {
+          yield `sell failed for ${wi.name}: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      }
+
+      // Also sell any other non-ore cargo while docked
+      for (const cargo of ctx.ship.cargo) {
+        if (withdrawnIds.has(cargo.itemId) || cargo.itemId.startsWith("ore_") || isProtectedItem(cargo.itemId)) continue;
+        try {
+          const result = await ctx.api.sell(cargo.itemId, cargo.quantity);
+          await ctx.refreshState();
+          if (result.total > 0) {
+            yield `sold ${result.quantity} ${cargo.itemId} @ ${result.priceEach}cr = ${result.total}cr`;
+            stationSoldAny = true;
+          }
+        } catch { /* non-critical */ }
+      }
+
+      if (stationSoldAny) {
+        sold = true;
+        // Check if cargo is empty — no need to try more stations
+        const remainingCargo = ctx.ship.cargo.filter((c) => !c.itemId.startsWith("ore_") && !isProtectedItem(c.itemId) && c.quantity > 0);
+        if (remainingCargo.length === 0) break;
+        yield `${remainingCargo.length} item(s) unsold — trying next station`;
+      } else {
+        yield "nothing sold here — trying next station";
       }
     }
 
-    // Also sell any other non-ore cargo
-    for (const cargo of ctx.ship.cargo) {
-      if (cargo.itemId === withdrawnItem || cargo.itemId.startsWith("ore_") || isProtectedItem(cargo.itemId)) continue;
+    // If still holding unsold cargo after all stations tried, re-deposit
+    if (!sold) {
+      yield "all known buyers failed — re-depositing cargo";
+    }
+    const unsoldCargo = ctx.ship.cargo.filter((c) => !c.itemId.startsWith("ore_") && !isProtectedItem(c.itemId) && c.quantity > 0);
+    if (unsoldCargo.length > 0) {
+      // Navigate back to faction station to re-deposit leftovers
       try {
-        const result = await ctx.api.sell(cargo.itemId, cargo.quantity);
-        await ctx.refreshState();
-        if (result.total > 0) {
-          yield `sold ${result.quantity} ${cargo.itemId} @ ${result.priceEach}cr = ${result.total}cr`;
+        await navigateAndDock(ctx, factionStation);
+        for (const c of unsoldCargo) {
+          try {
+            await ctx.api.factionDepositItems(c.itemId, c.quantity);
+            yield `re-deposited ${c.quantity} ${ctx.crafting.getItemName(c.itemId)}`;
+          } catch { /* best effort */ }
         }
-      } catch { /* non-critical */ }
+        await ctx.refreshState();
+      } catch {
+        yield "could not return to faction station — cargo stranded";
+      }
     }
 
     // Faction tax on sell profits

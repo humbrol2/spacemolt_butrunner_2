@@ -63,6 +63,12 @@ export class Bot {
   /** All ships this bot owns (populated after login) */
   private _ownedShips: Array<{ id: string; classId: string }> = [];
 
+  /** Cached name resolution for toSummary() — updated on location change */
+  private _cachedSystemName: string | null = null;
+  private _cachedPoiName: string | null = null;
+  private _cachedSystemId: string | null = null;
+  private _cachedPoiId: string | null = null;
+
   private deps: BotDeps | null = null;
 
   /** Configurable bot settings (updated via dashboard) */
@@ -154,10 +160,13 @@ export class Bot {
     const systemId = this._player?.currentSystem ?? null;
     const poiId = this._player?.currentPoi ?? null;
 
-    // Resolve names via Galaxy if deps are available
+    // Resolve names via Galaxy — use cache to avoid lookups every 3s
     let systemName = systemId;
     let poiName: string | null = null;
-    if (this.deps?.galaxy && systemId) {
+    if (systemId === this._cachedSystemId && poiId === this._cachedPoiId) {
+      systemName = this._cachedSystemName;
+      poiName = this._cachedPoiName;
+    } else if (this.deps?.galaxy && systemId) {
       const sys = this.deps.galaxy.getSystem(systemId);
       if (sys) {
         systemName = sys.name;
@@ -166,6 +175,10 @@ export class Bot {
           if (poi) poiName = poi.name;
         }
       }
+      this._cachedSystemId = systemId;
+      this._cachedPoiId = poiId;
+      this._cachedSystemName = systemName;
+      this._cachedPoiName = poiName;
     }
 
     return {
@@ -191,11 +204,21 @@ export class Bot {
       shieldPct: this._ship ? (this._ship.maxShield > 0 ? (this._ship.shield / this._ship.maxShield) * 100 : 0) : 0,
       shipClass: this._ship?.classId ?? null,
       shipName: this._ship?.name ?? null,
+      shipStats: this._ship ? {
+        hull: this._ship.hull, maxHull: this._ship.maxHull,
+        shield: this._ship.shield, maxShield: this._ship.maxShield,
+        armor: this._ship.armor, speed: this._ship.speed,
+        cpuUsed: this._ship.cpuUsed, cpuCapacity: this._ship.cpuCapacity,
+        powerUsed: this._ship.powerUsed, powerCapacity: this._ship.powerCapacity,
+      } : null,
       docked: this._player?.dockedAtBase !== null && this._player?.dockedAtBase !== undefined,
+      destination: this.resolveDestination(),
+      jumpsRemaining: this.resolveJumpsRemaining(),
       error: this._error,
       uptime: this.uptime,
       cargo: this._ship?.cargo.map((c) => ({ itemId: c.itemId, quantity: c.quantity })) ?? [],
       modules: this._ship?.modules.map((m) => ({ id: m.id, moduleId: m.moduleId, name: m.name })) ?? [],
+      ownedShips: this._ownedShips.map((s) => ({ id: s.id, classId: s.classId, name: null })),
       skills: this.buildSkillsSummary(),
       settings: {
         fuelEmergencyThreshold: this.settings.fuelEmergencyThreshold,
@@ -205,6 +228,100 @@ export class Bot {
         factionStorage: this.settings.factionStorage,
       },
     };
+  }
+
+  /** Resolve a human-readable destination from routine params + state */
+  private resolveDestination(): string | null {
+    // Strategy 1: Extract from routine params (static destination)
+    const paramDest = this.resolveDestinationFromParams();
+    if (paramDest) return paramDest;
+
+    // Strategy 2: Parse from routineState yield string (dynamic destination)
+    // Matches: "jumping to X", "traveling to X", "roaming to X", "navigating to X",
+    //          "returning to X", "towing to X", "trying station X"
+    const state = this._routineState;
+    if (state) {
+      const match = state.match(/(?:jumping|traveling|roaming|navigating|returning|towing|heading) to (.+?)(?:\.\.\.|$)/i);
+      if (match) return match[1].trim();
+    }
+
+    return null;
+  }
+
+  /** Resolve destination from static routine params */
+  private resolveDestinationFromParams(): string | null {
+    const p = this._params;
+    if (!p || !this.deps?.galaxy) return null;
+
+    const destKeys = ["sellStation", "buyStation", "targetBelt", "homeBase", "homeSystem", "targetSystem", "huntZone", "salvageYard", "craftStation"];
+    for (const key of destKeys) {
+      const val = p[key];
+      if (!val || typeof val !== "string") continue;
+
+      // Try to resolve as base ID → station name
+      const systemId = this.deps.galaxy.getSystemForBase(val);
+      if (systemId) {
+        const sys = this.deps.galaxy.getSystem(systemId);
+        if (sys) {
+          const poi = sys.pois.find((poi) => poi.baseId === val);
+          if (poi?.baseName) return poi.baseName;
+          if (poi?.name) return poi.name;
+        }
+        return val;
+      }
+
+      // Try to resolve as system ID → system name
+      const sys = this.deps.galaxy.getSystem(val);
+      if (sys) return sys.name;
+
+      // Try to resolve as POI ID → POI name
+      const poi = this.deps.galaxy.getPoi(val);
+      if (poi) return poi.name;
+
+      // Return raw value if non-empty
+      if (val.length > 0) return val;
+    }
+
+    return null;
+  }
+
+  /** Resolve jumps remaining to destination system */
+  private resolveJumpsRemaining(): number | null {
+    const currentSystem = this._player?.currentSystem;
+    if (!currentSystem || !this.deps?.galaxy) return null;
+
+    const p = this._params;
+    if (!p) return null;
+
+    // Find destination system ID from params
+    const destKeys = ["sellStation", "buyStation", "targetBelt", "homeBase", "homeSystem", "targetSystem", "huntZone", "salvageYard", "craftStation"];
+    for (const key of destKeys) {
+      const val = p[key];
+      if (!val || typeof val !== "string") continue;
+
+      let destSystemId: string | null = null;
+
+      // Base ID → system ID
+      const sysForBase = this.deps.galaxy.getSystemForBase(val);
+      if (sysForBase) destSystemId = sysForBase;
+
+      // System ID directly
+      if (!destSystemId && this.deps.galaxy.getSystem(val)) destSystemId = val;
+
+      // POI ID → parent system
+      if (!destSystemId) {
+        const poiSystem = this.deps.galaxy.getSystemForPoi(val);
+        if (poiSystem) destSystemId = poiSystem;
+      }
+
+      if (destSystemId) {
+        if (destSystemId === currentSystem) return 0;
+        const dist = this.deps.galaxy.getDistance(currentSystem, destSystemId);
+        return dist >= 0 ? dist : null;
+      }
+    }
+
+    return null;
   }
 
   /** Build skills summary from stored data */
@@ -271,11 +388,21 @@ export class Bot {
         // Skills from login PlayerState will be used as fallback
       }
 
+      // Fetch full ship details (get_status returns module IDs as strings, get_ship has full objects)
+      try {
+        const fullShip = await this.deps.api.getShip();
+        if (fullShip.modules.length > 0 && fullShip.modules[0].moduleId) {
+          this._ship = { ...this._ship!, modules: fullShip.modules };
+        }
+      } catch {
+        // Non-critical — modules will show IDs instead of names
+      }
+
       // Fetch owned ships (non-blocking, best-effort)
       try {
         const ships = await this.deps.api.listShips();
         this._ownedShips = ships.map((s) => ({
-          id: String(s.id ?? ""),
+          id: String(s.ship_id ?? s.id ?? ""),
           classId: String(s.class_id ?? s.classId ?? s.ship_class ?? ""),
         })).filter((s) => s.id && s.classId);
         if (this._ownedShips.length > 1) {
@@ -422,7 +549,17 @@ export class Bot {
       refreshState: async () => {
         const status = await deps.api.getStatus();
         bot._player = status.player;
+        // Preserve full module details (name, moduleId) from getShip() —
+        // getStatus() returns modules as bare string IDs which lose that info
+        const oldModules = bot._ship?.modules;
         bot._ship = status.ship;
+        if (oldModules?.length && bot._ship) {
+          bot._ship.modules = bot._ship.modules.map((m) => {
+            if (m.moduleId) return m; // already has full data
+            const prev = oldModules.find((o) => o.id === m.id);
+            return prev ?? m;
+          });
+        }
       },
       recordFactionWithdrawal: (amount: number) => {
         bot.recordFactionWithdrawal(amount);

@@ -24,6 +24,7 @@ function makeBot(overrides: Partial<FleetBotInfo> = {}): FleetBotInfo {
     hullPct: 100,
     moduleIds: ["mining_laser_1", "weapon_laser_1"],
     shipClass: "shuttle",
+    cargoCapacity: 100,
     ownedShips: [],
     skills: { mining: 3, trading: 2, crafting: 1 },
     rapidRoutines: new Map(),

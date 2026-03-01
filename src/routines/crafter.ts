@@ -129,15 +129,20 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<string, void, vo
     if (ctx.shouldStop) return;
 
     // ── Source materials ──
-    const sourced = await sourceMaterials(ctx, recipe, count, materialSource, skillTraining);
-    if (!sourced.ok) {
-      yield `${sourced.reason} — waiting for materials`;
-      await interruptibleSleep(ctx, 120_000); // Wait 2 min for miners/crafters to produce
-      yield "cycle_complete";
-      continue; // Retry — materials may appear in faction storage
-    }
-    for (const msg of sourced.messages) {
-      yield msg;
+    // For chain recipes (multi-step), skip pre-sourcing the top-level recipe —
+    // the chain loop below handles each step individually, avoiding cargo overflow
+    // from loading intermediates + raw materials simultaneously
+    if (chain.length <= 1) {
+      const sourced = await sourceMaterials(ctx, recipe, count, materialSource, skillTraining);
+      if (!sourced.ok) {
+        yield `${sourced.reason} — waiting for materials`;
+        await interruptibleSleep(ctx, 120_000); // Wait 2 min for miners/crafters to produce
+        yield "cycle_complete";
+        continue; // Retry — materials may appear in faction storage
+      }
+      for (const msg of sourced.messages) {
+        yield msg;
+      }
     }
 
     if (ctx.shouldStop) return;
@@ -311,21 +316,46 @@ async function sourceMaterials(
       const stillMissing = ing.missing - got;
 
       if (source === "storage") {
-        try {
-          // Use faction storage if bot settings say so
-          if (ctx.settings.factionStorage || ctx.fleetConfig.defaultStorageMode === "faction_deposit") {
-            await ctx.api.factionWithdrawItems(ing.itemId, stillMissing);
-          } else {
-            await ctx.api.withdrawItems(ing.itemId, stillMissing);
+        // Cap withdrawal by available cargo space (same as market buys)
+        const itemSize = ctx.cargo.getItemSize(ctx.ship, ing.itemId);
+        const freeWeight = ctx.cargo.freeSpace(ctx.ship);
+        const maxByWeight = Math.floor(freeWeight / Math.max(1, itemSize));
+        const safeQty = Math.min(stillMissing, maxByWeight);
+        if (safeQty <= 0) {
+          console.warn(`[${ctx.botId}] no cargo space for ${ing.itemId} from storage (size ${itemSize}, free ${freeWeight})`);
+        } else {
+          const isFaction = ctx.settings.factionStorage || ctx.fleetConfig.defaultStorageMode === "faction_deposit";
+          try {
+            if (isFaction) {
+              await ctx.api.factionWithdrawItems(ing.itemId, safeQty);
+            } else {
+              await ctx.api.withdrawItems(ing.itemId, safeQty);
+            }
+            await ctx.refreshState();
+            got += safeQty;
+            messages.push(`withdrew ${safeQty} ${ctx.crafting.getItemName(ing.itemId)} from ${isFaction ? "faction" : "personal"} storage`);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            // cargo_full: item weighs more than 1 per unit — retry with halved qty
+            if (msg.includes("cargo_full") && safeQty > 1) {
+              const retryQty = Math.max(1, Math.floor(safeQty / 2));
+              try {
+                if (isFaction) {
+                  await ctx.api.factionWithdrawItems(ing.itemId, retryQty);
+                } else {
+                  await ctx.api.withdrawItems(ing.itemId, retryQty);
+                }
+                await ctx.refreshState();
+                got += retryQty;
+                messages.push(`withdrew ${retryQty} ${ctx.crafting.getItemName(ing.itemId)} (retry, item heavier than expected)`);
+              } catch {
+                console.warn(`[${ctx.botId}] storage withdraw retry failed for ${ing.itemId}`);
+              }
+            } else {
+              console.warn(`[${ctx.botId}] storage withdraw failed for ${ing.itemId}: ${msg}`);
+            }
           }
-          await ctx.refreshState();
-          got += stillMissing;
-          const storageType = (ctx.settings.factionStorage || ctx.fleetConfig.defaultStorageMode === "faction_deposit") ? "faction" : "personal";
-          messages.push(`withdrew ${stillMissing} ${ctx.crafting.getItemName(ing.itemId)} from ${storageType} storage`);
-        } catch (err) {
-            // Storage withdrawal failed — try next source
-            console.warn(`[${ctx.botId}] storage withdraw failed for ${ing.itemId}: ${err instanceof Error ? err.message : err}`);
-          }
+        }
       } else if (source === "market") {
         try {
           // Weight-aware buy: cap quantity by available cargo weight

@@ -155,10 +155,14 @@ export interface MarketOrder {
   itemId: string;
   itemName: string;
   quantity: number;
+  remaining: number;
   priceEach: number;
   playerId: string;
   playerName: string;
   stationId: string;
+  stationName: string;
+  createdAt: string;
+  status: string;
 }
 
 export interface MarketPrice {

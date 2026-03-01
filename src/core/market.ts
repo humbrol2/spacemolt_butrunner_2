@@ -81,11 +81,15 @@ export class Market {
 
   /**
    * Find arbitrage opportunities between cached stations.
-   * Ranks by profit-per-tick (factors in travel time).
+   * Ranks by profit-per-tick (factors in travel time, fuel cost, return trip).
+   * @param cargoCapacity - Bot's actual cargo capacity (defaults to 100 if unknown)
+   * @param fuelCostPerJump - Estimated credit cost per jump for fuel (default 50)
    */
   findArbitrage(
     cachedStationIds: string[],
-    fromSystemId: string
+    fromSystemId: string,
+    cargoCapacity: number = 100,
+    fuelCostPerJump: number = 50,
   ): TradeRoute[] {
     const routes: TradeRoute[] = [];
 
@@ -123,8 +127,9 @@ export class Market {
           const tradeDist = this.galaxy.getDistance(buySystemId, sellSystemId);
           if (distFromHere < 0 || tradeDist < 0) continue;
 
-          // Each jump = ~10s (1 tick). Add 2 ticks for dock/buy/sell/undock overhead.
-          const totalTicks = distFromHere + tradeDist + 2;
+          // Each jump = ~10s (1 tick). Add 4 ticks for dock/buy/sell/undock overhead.
+          // Include return trip (buy→sell→buy) for repeatable routes.
+          const totalTicks = distFromHere + tradeDist * 2 + 4;
           const profitPerTick = profitPerUnit / Math.max(1, totalTicks);
 
           // Volume-aware: how many units can actually be traded?
@@ -132,9 +137,24 @@ export class Market {
             buyPriceData.buyVolume || Infinity,
             sellPriceData.sellVolume || Infinity,
           );
-          // Clamp to a reasonable cargo hold size (100 units) for ranking
-          const effectiveVolume = Math.min(tradeableVolume, 100);
-          const tripProfitPerTick = (profitPerUnit * effectiveVolume) / Math.max(1, totalTicks);
+          // Clamp to actual cargo capacity (not hardcoded 100)
+          const effectiveVolume = Math.min(tradeableVolume, cargoCapacity);
+
+          // Minimum margin: at least 10% profit on buy price (avoid risky high-value low-margin trades)
+          if (profitPerUnit / buyPriceData.buyPrice < 0.10) continue;
+
+          // Subtract fuel cost from profit (round trip: to buy + buy→sell + sell→buy)
+          const totalJumps = distFromHere + tradeDist * 2;
+          const fuelCost = totalJumps * fuelCostPerJump;
+          const tripProfit = Math.max(0, profitPerUnit * effectiveVolume - fuelCost);
+          if (tripProfit < 200) continue; // Skip routes netting under 200cr after fuel
+
+          // Age-weight: discount older data (0.97^ageMinutes — 5min=~85%, 15min=~63%, 30min=~40%)
+          const buyAge = this.cache.getMarketFreshness(buyStationId).ageMs;
+          const sellAge = this.cache.getMarketFreshness(sellStationId).ageMs;
+          const maxAgeMin = Math.max(buyAge, sellAge) / 60_000;
+          const confidence = Math.pow(0.97, Math.min(maxAgeMin, 60)); // Cap at 60 min
+          const tripProfitPerTick = (tripProfit * confidence) / Math.max(1, totalTicks);
 
           routes.push({
             itemId,
@@ -165,7 +185,8 @@ export class Market {
   scoreTradeRoute(
     route: TradeRoute,
     cargoSpace: number,
-    fromSystemId: string
+    fromSystemId: string,
+    fuelCostPerJump: number = 50,
   ): number {
     const buySystemId = this.galaxy.getSystemForBase(route.buyStationId);
     if (!buySystemId) return 0;
@@ -173,8 +194,9 @@ export class Market {
     const distToStart = this.galaxy.getDistance(fromSystemId, buySystemId);
     if (distToStart < 0) return 0;
 
-    const totalTicks = distToStart + route.jumps + 2;
-    const totalProfit = route.profitPerUnit * cargoSpace;
+    const totalTicks = distToStart + route.jumps * 2 + 4;
+    const totalJumps = distToStart + route.jumps * 2;
+    const totalProfit = Math.max(0, route.profitPerUnit * cargoSpace - totalJumps * fuelCostPerJump);
     return totalProfit / Math.max(1, totalTicks);
   }
 

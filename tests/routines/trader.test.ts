@@ -12,8 +12,8 @@ function setSellStationPrices(ctx: any, stationId: string, items: Array<{ itemId
 describe("Trader Routine", () => {
   test("auto-discovers trade route when params empty", async () => {
     const { ctx } = buildMockContext({ params: {} });
-    const yields = await collectYields(trader(ctx));
-    expect(yields[0]).toContain("discovering trade route...");
+    const yields = await runUntilYield(ctx, trader(ctx), "discovering trade route", 10);
+    expect(yields[0]).toContain("discovering trade routes...");
   });
 
   test("completes a buy-sell round trip", async () => {

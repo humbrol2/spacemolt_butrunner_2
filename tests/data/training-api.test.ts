@@ -280,6 +280,7 @@ describe("Training API", () => {
         shipState: { fuel: 80 },
         location: { system: "sol" },
       });
+      logger.flushSnapshots();
 
       const res = await callRoute("export/snapshots", db, logger);
       const data = await res.json();
@@ -428,6 +429,7 @@ describe("Training API", () => {
     test("clears all tables with confirm", async () => {
       logger.logDecision({ tick: 1, botId: "bot1", action: "mine", context: {} });
       logger.logSnapshot({ tick: 1, botId: "bot1", playerState: {}, shipState: {}, location: {} });
+      logger.flushSnapshots();
 
       const res = await callRoute("clear", db, logger, "POST", { confirm: true });
       const data = await res.json();
@@ -439,6 +441,7 @@ describe("Training API", () => {
     test("clears specific tables", async () => {
       logger.logDecision({ tick: 1, botId: "bot1", action: "mine", context: {} });
       logger.logSnapshot({ tick: 1, botId: "bot1", playerState: {}, shipState: {}, location: {} });
+      logger.flushSnapshots();
 
       const res = await callRoute("clear", db, logger, "POST", {
         confirm: true,

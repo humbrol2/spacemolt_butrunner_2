@@ -5,6 +5,38 @@
 
 import type { ShipClass } from "../types/game";
 
+/**
+ * Legacy/pre-catalog ships that can't be bought from shipyards but may be owned.
+ * Real stats obtained from in-game get_status after switching to each ship (2026-02-28).
+ */
+export const LEGACY_SHIPS: ShipClass[] = [
+  {
+    id: "mining_barge", name: "Excavator", category: "Industrial", description: "Legacy mining barge",
+    basePrice: 0, hull: 180, shield: 60, armor: 12, speed: 2, fuel: 150,
+    cargoCapacity: 150, cpuCapacity: 20, powerCapacity: 40,
+  },
+  {
+    id: "freighter_medium", name: "Merchantman", category: "Industrial", description: "Legacy medium freighter",
+    basePrice: 0, hull: 250, shield: 80, armor: 22, speed: 2, fuel: 300,
+    cargoCapacity: 450, cpuCapacity: 18, powerCapacity: 35,
+  },
+  {
+    id: "fighter_scout", name: "Sparrow", category: "Combat", description: "Legacy scout fighter",
+    basePrice: 0, hull: 70, shield: 45, armor: 6, speed: 4, fuel: 90,
+    cargoCapacity: 15, cpuCapacity: 12, powerCapacity: 24,
+  },
+  {
+    id: "fighter_light", name: "Viper", category: "Combat", description: "Legacy light fighter",
+    basePrice: 0, hull: 80, shield: 60, armor: 13, speed: 5, fuel: 80,
+    cargoCapacity: 15, cpuCapacity: 15, powerCapacity: 30,
+  },
+  {
+    id: "starter_mining", name: "Prospector", category: "Industrial", description: "Legacy starter mining vessel",
+    basePrice: 0, hull: 100, shield: 50, armor: 5, speed: 2, fuel: 100,
+    cargoCapacity: 50, cpuCapacity: 12, powerCapacity: 25,
+  },
+];
+
 /** Stat weight profile for a role */
 interface RoleProfile {
   cargo: number;
@@ -24,6 +56,7 @@ const ROLE_PROFILES: Record<string, RoleProfile> = {
   crafter:       { cargo: 0.3, cpu: 0.3, hull: 0.2, fuel: 0.1, speed: 0.1 },
   hunter:        { hull: 0.3, speed: 0.25, cpu: 0.2, shield: 0.15, cargo: 0.1, fuel: 0.0 },
   salvager:      { cargo: 0.35, hull: 0.25, fuel: 0.2, speed: 0.15, cpu: 0.05 },
+  scavenger:     { cargo: 0.3, fuel: 0.3, speed: 0.25, hull: 0.1, cpu: 0.05 },
   quartermaster: { cargo: 0.3, cpu: 0.2, hull: 0.2, fuel: 0.15, speed: 0.15 },
   default:       { cargo: 0.25, fuel: 0.25, hull: 0.2, speed: 0.15, cpu: 0.15 },
 };

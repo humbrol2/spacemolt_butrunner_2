@@ -65,6 +65,8 @@ export class ApiClient {
   // API call counters
   private mutationCount = 0;
   private queryCount = 0;
+  /** Timestamp of last mutation — used for client-side throttle */
+  private lastMutationAt = 0;
 
   constructor(opts: ApiClientOptions) {
     this.username = opts.username;
@@ -257,33 +259,26 @@ export class ApiClient {
       const itemId = str(item.item_id ?? item.itemId);
       const itemName = str(item.item_name ?? item.itemName ?? item.name);
       // Expand sell orders
+      const baseId = str(data.base ?? "");
       const sellOrders = (item.sell_orders ?? []) as Array<Record<string, unknown>>;
       for (const so of sellOrders) {
         orders.push({
-          id: "",
-          type: "sell",
-          itemId,
-          itemName,
-          quantity: num(so.quantity),
+          id: str(so.order_id ?? ""), type: "sell", itemId, itemName,
+          quantity: num(so.quantity), remaining: num(so.remaining ?? so.quantity),
           priceEach: num(so.price_each ?? so.price),
-          playerId: str(so.player_id),
-          playerName: str(so.player_name ?? so.source),
-          stationId: str(data.base ?? ""),
+          playerId: str(so.player_id), playerName: str(so.player_name ?? so.source),
+          stationId: baseId, stationName: "", createdAt: str(so.created_at ?? ""), status: str(so.status ?? "open"),
         });
       }
       // Expand buy orders
       const buyOrders = (item.buy_orders ?? []) as Array<Record<string, unknown>>;
       for (const bo of buyOrders) {
         orders.push({
-          id: "",
-          type: "buy",
-          itemId,
-          itemName,
-          quantity: num(bo.quantity),
+          id: str(bo.order_id ?? ""), type: "buy", itemId, itemName,
+          quantity: num(bo.quantity), remaining: num(bo.remaining ?? bo.quantity),
           priceEach: num(bo.price_each ?? bo.price),
-          playerId: str(bo.player_id),
-          playerName: str(bo.player_name),
-          stationId: str(data.base ?? ""),
+          playerId: str(bo.player_id), playerName: str(bo.player_name),
+          stationId: baseId, stationName: "", createdAt: str(bo.created_at ?? ""), status: str(bo.status ?? "open"),
         });
       }
       // Fallback: if no sub-orders but we have aggregated prices, create synthetic entries
@@ -291,10 +286,10 @@ export class ApiClient {
         const sp = num(item.sell_price ?? item.sellPrice);
         const bp = num(item.buy_price ?? item.buyPrice);
         if (sp > 0) {
-          orders.push({ id: "", type: "sell", itemId, itemName, quantity: num(item.sell_quantity ?? item.sellQuantity), priceEach: sp, playerId: "", playerName: "", stationId: str(data.base ?? "") });
+          orders.push({ id: "", type: "sell", itemId, itemName, quantity: num(item.sell_quantity ?? item.sellQuantity), remaining: 0, priceEach: sp, playerId: "", playerName: "", stationId: baseId, stationName: "", createdAt: "", status: "open" });
         }
         if (bp > 0) {
-          orders.push({ id: "", type: "buy", itemId, itemName, quantity: num(item.buy_quantity ?? item.buyQuantity), priceEach: bp, playerId: "", playerName: "", stationId: str(data.base ?? "") });
+          orders.push({ id: "", type: "buy", itemId, itemName, quantity: num(item.buy_quantity ?? item.buyQuantity), remaining: 0, priceEach: bp, playerId: "", playerName: "", stationId: baseId, stationName: "", createdAt: "", status: "open" });
         }
       }
     }
@@ -754,7 +749,13 @@ export class ApiClient {
   }
 
   private async mutation<T>(cmd: string, params: Record<string, unknown> = {}): Promise<T> {
+    // Client-side throttle: wait if < 10s since last mutation to avoid action_in_progress penalty
+    const elapsed = Date.now() - this.lastMutationAt;
+    if (elapsed < 10_000 && this.lastMutationAt > 0) {
+      await sleep(10_000 - elapsed);
+    }
     this.mutationCount++;
+    this.lastMutationAt = Date.now();
     return this.call<T>(cmd, params);
   }
 
@@ -947,11 +948,12 @@ function normalizeShip(raw: Record<string, unknown>): ShipState {
     cpuCapacity: num(raw.cpu_capacity),
     powerUsed: num(raw.power_used),
     powerCapacity: num(raw.power_capacity),
-    modules: ((raw.modules as Array<Record<string, unknown>>) ?? []).map((m) => ({
-      id: str(m.id),
-      moduleId: str(m.module_id),
-      name: str(m.name),
-    })),
+    modules: ((raw.modules as unknown[]) ?? []).map((m) => {
+      // get_status returns module IDs as strings; get_ship returns full objects
+      if (typeof m === "string") return { id: m, moduleId: "", name: "" };
+      const obj = m as Record<string, unknown>;
+      return { id: str(obj.id), moduleId: str(obj.module_id ?? obj.type_id), name: str(obj.name) };
+    }),
     cargo: ((raw.cargo as Array<Record<string, unknown>>) ?? []).map((c) => ({
       itemId: str(c.item_id),
       quantity: num(c.quantity),
@@ -1023,15 +1025,19 @@ function normalizePoi(raw: Record<string, unknown>): PoiDetail {
 
 function normalizeMarketOrder(raw: Record<string, unknown>): MarketOrder {
   return {
-    id: str(raw.id),
+    id: str(raw.order_id ?? raw.id),
     type: str(raw.type) as "buy" | "sell",
     itemId: str(raw.item_id),
     itemName: str(raw.item_name),
     quantity: num(raw.quantity),
+    remaining: num(raw.remaining ?? raw.quantity),
     priceEach: num(raw.price_each),
     playerId: str(raw.player_id),
     playerName: str(raw.player_name),
-    stationId: str(raw.station_id),
+    stationId: str(raw.station_id ?? raw.base_id),
+    stationName: str(raw.station_name ?? raw.base_name ?? ""),
+    createdAt: str(raw.created_at ?? ""),
+    status: str(raw.status ?? "open"),
   };
 }
 

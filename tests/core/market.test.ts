@@ -15,6 +15,10 @@ class MockGameCache {
   getMarketPrices(stationId: string): MarketPrice[] | null {
     return this.prices.get(stationId) ?? null;
   }
+
+  getMarketFreshness(stationId: string): { stationId: string; fetchedAt: number; ageMs: number; fresh: boolean } {
+    return { stationId, fetchedAt: Date.now(), ageMs: 0, fresh: true };
+  }
 }
 
 function setupGalaxy(): Galaxy {

@@ -14,32 +14,20 @@ import type {
   EconomySnapshot,
 } from "./types";
 
-/** Production rates per routine per hour (rough estimates, tunable) */
-const ROUTINE_PRODUCTION: Record<string, { itemId: string; qtyPerHour: number }[]> = {
-  miner: [
-    { itemId: "ore_iron", qtyPerHour: 30 },
-    { itemId: "ore_copper", qtyPerHour: 15 },
-    { itemId: "ore_titanium", qtyPerHour: 10 },
-    { itemId: "ore_gold", qtyPerHour: 5 },
-  ],
-  harvester: [
-    { itemId: "ore_ice_nitrogen", qtyPerHour: 25 },
-    { itemId: "ore_ice_hydrogen", qtyPerHour: 20 },
-    { itemId: "ore_crystal", qtyPerHour: 5 },
-  ],
-  crafter: [
-    { itemId: "refined_steel", qtyPerHour: 10 },
-    { itemId: "component_electronics", qtyPerHour: 5 },
-  ],
+/** Fallback production rates per routine (used when no observed data yet) */
+const FALLBACK_PRODUCTION: Record<string, { itemId: string; qtyPerHour: number }[]> = {
+  miner: [{ itemId: "ore_iron", qtyPerHour: 20 }],
+  harvester: [{ itemId: "ore_ice_nitrogen", qtyPerHour: 15 }],
+  crafter: [{ itemId: "refined_steel", qtyPerHour: 5 }],
 };
 
-/** Consumption rates per routine per hour (rough estimates) */
-const ROUTINE_CONSUMPTION: Record<string, { itemId: string; qtyPerHour: number }[]> = {
-  crafter: [
-    { itemId: "ore_iron", qtyPerHour: 20 },
-    { itemId: "ore_copper", qtyPerHour: 10 },
-  ],
+/** Fallback consumption rates per routine */
+const FALLBACK_CONSUMPTION: Record<string, { itemId: string; qtyPerHour: number }[]> = {
+  crafter: [{ itemId: "ore_iron", qtyPerHour: 10 }],
 };
+
+/** Sliding window duration for observed production tracking (1 hour) */
+const OBSERVATION_WINDOW_MS = 3_600_000;
 
 export class EconomyEngine {
   private demands: MaterialDemand[] = [];
@@ -48,9 +36,62 @@ export class EconomyEngine {
   private stationInventory = new Map<string, Map<string, number>>(); // station → item → qty
   private factionInventory = new Map<string, number>(); // item → qty (shared faction storage)
 
-  // Profit tracking
-  private revenueHistory: number[] = [];
-  private costHistory: number[] = [];
+  // Profit tracking (running totals — reset daily)
+  private totalRevenue = 0;
+  private totalCosts = 0;
+
+  /**
+   * Observed production/consumption per bot: botId → itemId → timestamped events.
+   * Events are trimmed to the observation window on each analyze() call.
+   */
+  private observedProduction = new Map<string, Array<{ itemId: string; qty: number; at: number }>>();
+  private observedConsumption = new Map<string, Array<{ itemId: string; qty: number; at: number }>>();
+
+  /** Record an observed production event (e.g., miner deposited 10 ore_iron) */
+  recordProduction(botId: string, itemId: string, qty: number): void {
+    if (qty <= 0) return;
+    if (!this.observedProduction.has(botId)) this.observedProduction.set(botId, []);
+    this.observedProduction.get(botId)!.push({ itemId, qty, at: Date.now() });
+  }
+
+  /** Record an observed consumption event (e.g., crafter consumed 5 ore_iron) */
+  recordConsumption(botId: string, itemId: string, qty: number): void {
+    if (qty <= 0) return;
+    if (!this.observedConsumption.has(botId)) this.observedConsumption.set(botId, []);
+    this.observedConsumption.get(botId)!.push({ itemId, qty, at: Date.now() });
+  }
+
+  /** Get observed per-hour rates for a bot (production) */
+  private getObservedRates(botId: string, type: "production" | "consumption"): Map<string, number> {
+    const store = type === "production" ? this.observedProduction : this.observedConsumption;
+    const events = store.get(botId);
+    if (!events || events.length === 0) return new Map();
+
+    const now = Date.now();
+    const cutoff = now - OBSERVATION_WINDOW_MS;
+    // Trim old events
+    const recent = events.filter((e) => e.at >= cutoff);
+    store.set(botId, recent);
+
+    if (recent.length === 0) return new Map();
+
+    // Sum quantities per item
+    const sums = new Map<string, number>();
+    for (const e of recent) {
+      sums.set(e.itemId, (sums.get(e.itemId) ?? 0) + e.qty);
+    }
+
+    // Convert to per-hour rate: qty / (window hours elapsed)
+    const oldestEvent = recent[0].at;
+    const elapsed = Math.max(now - oldestEvent, 60_000); // Min 1 minute to avoid division by tiny number
+    const hoursElapsed = elapsed / 3_600_000;
+
+    const rates = new Map<string, number>();
+    for (const [itemId, total] of sums) {
+      rates.set(itemId, total / hoursElapsed);
+    }
+    return rates;
+  }
 
   /** Set inventory targets from config */
   setStockTargets(targets: StockTarget[]): void {
@@ -109,12 +150,12 @@ export class EconomyEngine {
 
   /** Record revenue (credits earned from selling) */
   recordRevenue(amount: number): void {
-    this.revenueHistory.push(amount);
+    this.totalRevenue += amount;
   }
 
   /** Record cost (credits spent on buying/refueling/repair) */
   recordCost(amount: number): void {
-    this.costHistory.push(amount);
+    this.totalCosts += amount;
   }
 
   /**
@@ -128,9 +169,8 @@ export class EconomyEngine {
     const surpluses = this.computeSurpluses();
     const inventoryAlerts = this.checkInventoryTargets();
 
-    // Calculate profit from recent history
-    const totalRevenue = this.revenueHistory.reduce((s, r) => s + r, 0);
-    const totalCosts = this.costHistory.reduce((s, c) => s + c, 0);
+    const totalRevenue = this.totalRevenue;
+    const totalCosts = this.totalCosts;
     const netProfit = totalRevenue - totalCosts;
 
     return {
@@ -146,8 +186,8 @@ export class EconomyEngine {
 
   /** Reset profit tracking (call at beginning of each evaluation period) */
   resetProfitTracking(): void {
-    this.revenueHistory = [];
-    this.costHistory = [];
+    this.totalRevenue = 0;
+    this.totalCosts = 0;
   }
 
   // ── Internal ──
@@ -159,35 +199,40 @@ export class EconomyEngine {
     for (const bot of fleet.bots) {
       if (bot.status !== "running" || !bot.routine) continue;
 
-      // Production
-      const production = ROUTINE_PRODUCTION[bot.routine];
-      if (production) {
-        for (const p of production) {
-          this.supplies.push({
-            itemId: p.itemId,
-            quantityPerHour: p.qtyPerHour,
-            source: bot.botId,
-          });
+      // Production: prefer observed rates, fall back to estimates
+      const observedProd = this.getObservedRates(bot.botId, "production");
+      if (observedProd.size > 0) {
+        for (const [itemId, qtyPerHour] of observedProd) {
+          this.supplies.push({ itemId, quantityPerHour: qtyPerHour, source: bot.botId });
+        }
+      } else {
+        const fallback = FALLBACK_PRODUCTION[bot.routine];
+        if (fallback) {
+          for (const p of fallback) {
+            this.supplies.push({ itemId: p.itemId, quantityPerHour: p.qtyPerHour, source: bot.botId });
+          }
         }
       }
 
-      // Consumption
-      const consumption = ROUTINE_CONSUMPTION[bot.routine];
-      if (consumption) {
-        for (const c of consumption) {
-          this.demands.push({
-            itemId: c.itemId,
-            quantityPerHour: c.qtyPerHour,
-            source: bot.botId,
-            priority: "normal",
-          });
+      // Consumption: prefer observed rates, fall back to estimates
+      const observedCons = this.getObservedRates(bot.botId, "consumption");
+      if (observedCons.size > 0) {
+        for (const [itemId, qtyPerHour] of observedCons) {
+          this.demands.push({ itemId, quantityPerHour: qtyPerHour, source: bot.botId, priority: "normal" });
+        }
+      } else {
+        const fallback = FALLBACK_CONSUMPTION[bot.routine];
+        if (fallback) {
+          for (const c of fallback) {
+            this.demands.push({ itemId: c.itemId, quantityPerHour: c.qtyPerHour, source: bot.botId, priority: "normal" });
+          }
         }
       }
 
       // Fuel demand for all active bots
       this.demands.push({
         itemId: "fuel",
-        quantityPerHour: 10, // Approximate fuel consumption
+        quantityPerHour: 10,
         source: bot.botId,
         priority: bot.fuelPct < 30 ? "critical" : "normal",
       });

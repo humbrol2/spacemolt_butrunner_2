@@ -14,6 +14,8 @@ export class Galaxy {
   private graph = new Map<string, SystemNode>();
   private poiIndex = new Map<string, { systemId: string; poi: PoiSummary }>();
   private baseToSystem = new Map<string, string>(); // baseId → systemId
+  /** Dirty flag: set when galaxy data changes, cleared after broadcast */
+  dirty = true;
 
   /** Load systems into the graph. Preserves existing non-zero coordinates (layout-generated). */
   load(systems: StarSystem[]): void {
@@ -37,6 +39,7 @@ export class Galaxy {
       }
       this.addSystemToGraph(sys);
     }
+    this.dirty = true;
   }
 
   /** Update or add a single system with full detail (POIs, connections). */
@@ -54,6 +57,7 @@ export class Galaxy {
       }
     }
     this.addSystemToGraph(sys);
+    this.dirty = true;
   }
 
   private addSystemToGraph(sys: StarSystem): void {

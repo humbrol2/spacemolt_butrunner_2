@@ -89,9 +89,9 @@ export async function* ship_upgrade(ctx: BotContext): AsyncGenerator<string, voi
       try {
         const ships = await ctx.api.listShips();
         const match = ships.find(
-          (s) => String(s.class_id ?? s.classId) === targetShipClass && String(s.id) !== oldShipId
+          (s) => String(s.class_id ?? s.classId) === targetShipClass && String(s.ship_id ?? s.id) !== oldShipId
         );
-        if (match) switchToId = String(match.id);
+        if (match) switchToId = String(match.ship_id ?? match.id);
       } catch (err) {
         yield `listShips failed: ${err instanceof Error ? err.message : String(err)}`;
         yield "cycle_complete";
@@ -188,10 +188,10 @@ export async function* ship_upgrade(ctx: BotContext): AsyncGenerator<string, voi
     const ships = await ctx.api.listShips();
     // Find a ship matching the target class that isn't our old ship
     const newShip = ships.find(
-      (s) => String(s.class_id ?? s.classId) === targetShipClass && String(s.id) !== oldShipId
+      (s) => String(s.class_id ?? s.classId) === targetShipClass && String(s.ship_id ?? s.id) !== oldShipId
     );
     if (newShip) {
-      await ctx.api.switchShip(String(newShip.id));
+      await ctx.api.switchShip(String(newShip.ship_id ?? newShip.id));
       await ctx.refreshState();
       yield `switched to ${targetShipClass}`;
     } else {

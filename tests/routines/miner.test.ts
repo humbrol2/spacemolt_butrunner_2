@@ -10,7 +10,7 @@ describe("Miner Routine", () => {
   });
 
   test("completes a mining cycle", async () => {
-    const { ctx, tracker } = buildMockContext({
+    const { ctx, tracker, ship } = buildMockContext({
       params: { targetBelt: "sol_belt", sellStation: "base_earth" },
       player: { currentSystem: "sol", currentPoi: "sol_earth", dockedAtBase: "base_earth" },
       ship: { cargoCapacity: 15, cargoUsed: 0, cargo: [] },
@@ -18,6 +18,18 @@ describe("Miner Routine", () => {
 
     // Mine depletes after 3 cycles, cargo becomes full
     tracker.mineDepletedAfter = 3;
+
+    // Override mine to actually add items to cargo (like the real game does)
+    (ctx.api as any).mine = async () => {
+      const result = tracker.recordMine();
+      if (result.quantity > 0) {
+        const existing = ship.cargo.find((c) => c.itemId === result.resourceId);
+        if (existing) existing.quantity += result.quantity;
+        else ship.cargo.push({ itemId: result.resourceId, quantity: result.quantity });
+        ship.cargoUsed += result.quantity;
+      }
+      return result;
+    };
 
     const yields = await runUntilYield(ctx, miner(ctx), "cycle_complete");
 

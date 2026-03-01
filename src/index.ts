@@ -14,10 +14,11 @@ import { Galaxy, Navigation, Market, Cargo, Fuel, Combat, Crafting, Station, Api
 import { BotManager, type SharedServices } from "./bot/bot-manager";
 import { Commander, type CommanderDeps } from "./commander/commander";
 import { ScoringBrain } from "./commander/scoring-brain";
+import { EconomyEngine } from "./commander/economy-engine";
 import { buildRoutineRegistry } from "./routines";
 import { createServer, broadcast, sendTo, getClientCount } from "./server/server";
 import { AppConfigSchema, type AppConfig, type Goal, type StockTarget } from "./types/config";
-import type { ClientMessage, RoutineName, FleetStats, ServerMessage, EconomyState, MarketStationData, FactionState } from "./types/protocol";
+import type { ClientMessage, RoutineName, FleetStats, ServerMessage, EconomyState, MarketStationData, FactionState, OpenOrder } from "./types/protocol";
 import type { Database } from "bun:sqlite";
 
 const VERSION = "2.0.0";
@@ -195,6 +196,7 @@ async function main() {
   const cacheHelper = new CacheHelper(db);
   const sessionStore = new SessionStore(db);
   const trainingLogger = new TrainingLogger(db);
+  trainingLogger.startSnapshotFlush();
   console.log("[DB] Database initialized");
 
   // Configure training logger
@@ -298,6 +300,9 @@ async function main() {
 
     // Track trade events (buy/sell) from routine state yields
     parseAndLogTrade(trainingLogger, botId, state);
+
+    // Track production/consumption for economy engine observed rates
+    parseProductionEvent(commander.getEconomy(), botId, state);
 
     // Scout completed: propagate discovered faction storage to entire fleet
     if (routine === "scout" && state.startsWith("faction storage confirmed")) {
@@ -450,7 +455,7 @@ async function main() {
             stationName: s.stationId || "Fleet",
             currentStock: s.currentStock,
           })),
-          openOrders: [],
+          openOrders: _cachedOrders,
           totalRevenue24h: ecoSnap.totalRevenue,
           totalCosts24h: ecoSnap.totalCosts,
           netProfit24h: ecoSnap.netProfit,
@@ -946,6 +951,47 @@ function parseAndLogTrade(logger: TrainingLogger, botId: string, state: string):
   }
 }
 
+/** Parse production/consumption events from routine yields to feed economy engine */
+function parseProductionEvent(economy: EconomyEngine, botId: string, state: string): void {
+  // Deposits = production (miner/crafter depositing to faction storage)
+  // "deposited 10 ore_iron to faction storage"
+  const depositMatch = state.match(/deposited (\d+)\s+(.+?)\s+to faction/i);
+  if (depositMatch) {
+    const qty = parseInt(depositMatch[1]);
+    const itemId = depositMatch[2];
+    if (qty > 0) economy.recordProduction(botId, itemId, qty);
+    return;
+  }
+
+  // Sells = production (trader/miner selling goods)
+  // "sold 10 ore_iron @ 10cr = 100cr"
+  const sellMatch = state.match(/sold (\d+)\s+(.+?)\s+@/i);
+  if (sellMatch) {
+    const qty = parseInt(sellMatch[1]);
+    const itemId = sellMatch[2];
+    if (qty > 0) economy.recordProduction(botId, itemId, qty);
+    return;
+  }
+
+  // Crafting consumption: "crafted 5 refined_steel (used 10 ore_iron, 5 ore_copper)"
+  // or "crafting: used 10 ore_iron"
+  const craftedMatch = state.match(/crafted (\d+)\s+(.+?)(?:\s+\(|$)/i);
+  if (craftedMatch) {
+    const qty = parseInt(craftedMatch[1]);
+    const itemId = craftedMatch[2];
+    if (qty > 0) economy.recordProduction(botId, itemId, qty);
+  }
+
+  // Withdrew from faction = consumption
+  // "withdrew 10 ore_iron"
+  const withdrawMatch = state.match(/withdrew (\d+)\s+(.+?)(?:\s+\(|$)/i);
+  if (withdrawMatch) {
+    const qty = parseInt(withdrawMatch[1]);
+    const itemId = withdrawMatch[2];
+    if (qty > 0) economy.recordConsumption(botId, itemId, qty);
+  }
+}
+
 function formatItemName(itemId: string): string {
   return itemId.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
@@ -963,7 +1009,85 @@ function resolveStationName(galaxy: Galaxy, stationId: string): string {
   return formatItemName(stationId);
 }
 
+/** Poll open orders from all bots and aggregate into OpenOrder[] */
+let _cachedOrders: OpenOrder[] = [];
+
+async function pollOpenOrders(botManager: BotManager, galaxy: Galaxy): Promise<OpenOrder[]> {
+  const allOrders: OpenOrder[] = [];
+
+  // Build station name lookup: baseId → baseName
+  const stationNames = new Map<string, string>();
+  for (const s of galaxy.findStations()) {
+    if (s.poi.baseId && s.poi.baseName) {
+      stationNames.set(s.poi.baseId, s.poi.baseName);
+    }
+  }
+  const stationIds = [...stationNames.keys()];
+  if (stationIds.length === 0) return _cachedOrders; // Galaxy not loaded yet
+
+  // Query each bot's orders at each known station (queries are free + unlimited)
+  const promises: Promise<void>[] = [];
+  for (const bot of botManager.getAllBots()) {
+    if (bot.status !== "ready" && bot.status !== "running") continue;
+    if (!bot.api) continue;
+    const botApi = bot.api;
+    const botName = bot.username;
+
+    for (const stationId of stationIds) {
+      promises.push(
+        botApi.viewOrders(stationId).then((orders) => {
+          for (const o of orders) {
+            if (o.status === "cancelled" || o.status === "filled") continue;
+            allOrders.push({
+              id: o.id,
+              type: o.type,
+              itemId: o.itemId,
+              itemName: o.itemName || formatItemName(o.itemId),
+              quantity: o.quantity,
+              filled: o.quantity - o.remaining,
+              priceEach: o.priceEach,
+              stationId: o.stationId || stationId,
+              stationName: stationNames.get(o.stationId || stationId) || stationId,
+              createdAt: o.createdAt,
+              botId: botName,
+            });
+          }
+        }).catch(() => {
+          // Station query failed — skip silently
+        })
+      );
+    }
+  }
+
+  await Promise.all(promises);
+
+  // Deduplicate by order ID (same order might appear from multiple queries)
+  const seen = new Set<string>();
+  const unique: OpenOrder[] = [];
+  for (const o of allOrders) {
+    if (!o.id || seen.has(o.id)) continue;
+    seen.add(o.id);
+    unique.push(o);
+  }
+
+  // Sort by station, then type (sell first), then item name
+  unique.sort((a, b) => {
+    if (a.stationName !== b.stationName) return a.stationName.localeCompare(b.stationName);
+    if (a.type !== b.type) return a.type === "sell" ? -1 : 1;
+    return a.itemName.localeCompare(b.itemName);
+  });
+
+  _cachedOrders = unique;
+  return unique;
+}
+
 /** Build faction state for dashboard broadcast */
+// Faction data cache (info + facilities rarely change)
+let _factionInfoCache: { data: Record<string, unknown>; at: number } | null = null;
+let _factionFacilitiesCache: { data: Array<Record<string, unknown>>; at: number } | null = null;
+let _factionStorageCache: { credits: number; items: import("./types/game").CargoItem[]; itemNames: Map<string, string> } | null = null;
+const FACTION_CACHE_TTL = 300_000; // 5 minutes
+
 async function buildFactionState(
   botManager: BotManager,
   commander: Commander,
@@ -1007,21 +1131,49 @@ async function buildFactionState(
   }
 
   try {
+    const now = Date.now();
+
+    // Use cached faction info if fresh (changes rarely)
+    const infoPromise = (_factionInfoCache && now - _factionInfoCache.at < FACTION_CACHE_TTL)
+      ? Promise.resolve(_factionInfoCache.data)
+      : api.factionInfo().then((data) => {
+          _factionInfoCache = { data, at: now };
+          return data;
+        }).catch((err) => {
+          console.warn("[Faction] factionInfo() failed:", err instanceof Error ? err.message : err);
+          return (_factionInfoCache?.data ?? {}) as Record<string, unknown>;
+        });
+
+    // Storage always fresh (changes frequently) — cache last-known-good as fallback
+    const storagePromise = (storageApi ?? api).viewFactionStorageFull().then((result) => {
+      if (result.items.length > 0 || result.credits > 0) {
+        _factionStorageCache = result;
+      }
+      return result;
+    }).catch((err) => {
+      console.warn("[Faction] viewFactionStorageFull() failed (bot may not be docked):", err instanceof Error ? err.message : err);
+      if (_factionStorageCache) {
+        console.log(`[Faction] using cached storage (${_factionStorageCache.items.length} items)`);
+        return _factionStorageCache;
+      }
+      return { credits: 0, items: [], itemNames: new Map<string, string>() };
+    });
+
+    // Use cached facilities if fresh (changes rarely)
+    const facilitiesPromise = (_factionFacilitiesCache && now - _factionFacilitiesCache.at < FACTION_CACHE_TTL)
+      ? Promise.resolve(_factionFacilitiesCache.data)
+      : (storageApi ?? api).factionListFacilities().then((data) => {
+          _factionFacilitiesCache = { data, at: now };
+          return data;
+        }).catch((err) => {
+          console.warn("[Faction] factionListFacilities() failed:", err instanceof Error ? err.message : err);
+          return (_factionFacilitiesCache?.data ?? []) as Array<Record<string, unknown>>;
+        });
+
     const [info, storageFull, rawFacilities] = await Promise.all([
-      api.factionInfo().catch((err) => {
-        console.warn("[Faction] factionInfo() failed:", err instanceof Error ? err.message : err);
-        return {} as Record<string, unknown>;
-      }),
-      // view_faction_storage requires docking — use docked bot if available
-      (storageApi ?? api).viewFactionStorageFull().catch((err) => {
-        console.warn("[Faction] viewFactionStorageFull() failed (bot may not be docked):", err instanceof Error ? err.message : err);
-        return { credits: 0, items: [], itemNames: new Map<string, string>() };
-      }),
-      // Faction facilities requires docking — use docked bot if available
-      (storageApi ?? api).factionListFacilities().catch((err) => {
-        console.warn("[Faction] factionListFacilities() failed:", err instanceof Error ? err.message : err);
-        return [] as Array<Record<string, unknown>>;
-      }),
+      infoPromise,
+      storagePromise,
+      facilitiesPromise,
     ]);
 
     console.log(`[Faction] factionInfo keys: ${Object.keys(info).join(", ")}, members: ${(info.members as unknown[])?.length ?? 0}`);
@@ -1048,6 +1200,13 @@ async function buildFactionState(
         itemName: storageFull.itemNames.get(i.itemId) || formatItemName(i.itemId),
         quantity: i.quantity,
       }));
+
+    // Seed economy engine with faction storage data so supply bonuses work from the start
+    if (storage.length > 0) {
+      const inventory = new Map<string, number>();
+      for (const s of storage) inventory.set(s.itemId, (inventory.get(s.itemId) ?? 0) + s.quantity);
+      commander.seedFactionInventory(inventory);
+    }
 
     return {
       id: factionId,
@@ -1671,7 +1830,7 @@ function startBroadcastLoop(
           broadcast({ type: "commander_decision", decision: lastDecision });
         }
 
-        if (galaxy.systemCount > 0) {
+        if (galaxy.systemCount > 0 && galaxy.dirty) {
           // Safety net: if all systems still at (0,0), regenerate layout now
           if (galaxy.allCoordsZero) {
             console.warn("[Broadcast] Galaxy coords still (0,0) — regenerating layout");
@@ -1680,6 +1839,7 @@ function startBroadcastLoop(
             gameCache.setMapCache(galaxy.getAllSystems());
           }
           broadcast({ type: "galaxy_update", systems: galaxy.toSummaries() });
+          galaxy.dirty = false;
         }
 
         // Economy state
@@ -1701,24 +1861,39 @@ function startBroadcastLoop(
             stationName: s.stationId || "Fleet",
             currentStock: s.currentStock,
           })),
-          openOrders: [],
+          openOrders: _cachedOrders,
           totalRevenue24h: ecoSnap.totalRevenue,
           totalCosts24h: ecoSnap.totalCosts,
           netProfit24h: ecoSnap.netProfit,
         };
         broadcast({ type: "economy_update", economy: economyState });
 
-        // Market data broadcast
-        const marketData = buildMarketData(gameCache, galaxy);
-        if (marketData.length > 0) {
-          broadcast({ type: "market_update", stations: marketData });
+        // Market data broadcast (only when market data has changed)
+        if (gameCache.marketDirty) {
+          const marketData = buildMarketData(gameCache, galaxy);
+          if (marketData.length > 0) {
+            broadcast({ type: "market_update", stations: marketData });
+          }
+          gameCache.marketDirty = false;
         }
 
         // Faction data broadcast (every 30s = tick 10, 20, 30...)
         if (tick % 10 === 0) {
           buildFactionState(botManager, commander, { defaultStorageMode }).then((faction) => {
             if (faction) broadcast({ type: "faction_update", faction });
-          }).catch(() => {});
+          }).catch((err) => {
+            console.warn("[Faction] broadcast failed:", err instanceof Error ? err.message : err);
+          });
+        }
+
+        // Open orders poll (every 60s = tick 20)
+        if (tick % 20 === 0) {
+          pollOpenOrders(botManager, galaxy).then((orders) => {
+            console.log(`[Orders] polled ${orders.length} open order(s) across fleet`);
+            broadcast({ type: "order_update", orders });
+          }).catch((err) => {
+            console.warn("[Orders] poll failed:", err instanceof Error ? err.message : err);
+          });
         }
 
         // Faction promotion check (every 60s = tick 20)

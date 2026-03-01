@@ -96,6 +96,11 @@
 			settingsInitialized = true;
 		}
 	});
+
+	/** Format item_id to display name */
+	function formatId(id: string): string {
+		return id.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+	}
 </script>
 
 <svelte:head>
@@ -226,29 +231,74 @@
 					</div>
 				</div>
 
-				<!-- Ship + Cargo + Modules -->
+				<!-- Ship Stats -->
+				<div class="mt-4">
+					<h3 class="text-sm font-semibold text-chrome-silver uppercase tracking-wider mb-2">Ship</h3>
+					<div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+						<div class="rounded-lg bg-deep-void/50 p-2.5">
+							<p class="text-xs text-chrome-silver">Name</p>
+							<p class="text-sm font-medium text-star-white">{bot.shipName ?? "Unknown"}</p>
+							<p class="text-xs text-hull-grey">{bot.shipClass ?? ""}</p>
+						</div>
+						{#if bot.shipStats}
+						<div class="rounded-lg bg-deep-void/50 p-2.5">
+							<p class="text-xs text-chrome-silver">Hull / Armor</p>
+							<p class="text-sm font-medium mono text-star-white">{bot.shipStats.hull}/{bot.shipStats.maxHull}</p>
+							<p class="text-xs text-hull-grey">Armor: {bot.shipStats.armor}</p>
+						</div>
+						<div class="rounded-lg bg-deep-void/50 p-2.5">
+							<p class="text-xs text-chrome-silver">Shield</p>
+							<p class="text-sm font-medium mono text-star-white">{bot.shipStats.shield}/{bot.shipStats.maxShield}</p>
+						</div>
+						<div class="rounded-lg bg-deep-void/50 p-2.5">
+							<p class="text-xs text-chrome-silver">Speed</p>
+							<p class="text-sm font-medium mono text-plasma-cyan">{bot.shipStats.speed}</p>
+						</div>
+						<div class="rounded-lg bg-deep-void/50 p-2.5">
+							<p class="text-xs text-chrome-silver">Fuel</p>
+							<p class="text-sm font-medium mono text-star-white">{bot.fuel}/{bot.maxFuel}</p>
+						</div>
+						<div class="rounded-lg bg-deep-void/50 p-2.5">
+							<p class="text-xs text-chrome-silver">Cargo</p>
+							<p class="text-sm font-medium mono text-star-white">{bot.cargoUsed}/{bot.cargoCapacity}</p>
+						</div>
+						<div class="rounded-lg bg-deep-void/50 p-2.5">
+							<p class="text-xs text-chrome-silver">CPU</p>
+							<p class="text-sm font-medium mono text-star-white">{bot.shipStats.cpuUsed}/{bot.shipStats.cpuCapacity}</p>
+						</div>
+						<div class="rounded-lg bg-deep-void/50 p-2.5">
+							<p class="text-xs text-chrome-silver">Power</p>
+							<p class="text-sm font-medium mono text-star-white">{bot.shipStats.powerUsed}/{bot.shipStats.powerCapacity}</p>
+						</div>
+						{/if}
+					</div>
+				</div>
+
+				<!-- Modules + Cargo + Owned Ships -->
 				<div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
 					<div>
-						<h3 class="text-sm font-semibold text-chrome-silver uppercase tracking-wider mb-2">Ship</h3>
-						<div class="text-sm space-y-1">
-							<div class="flex justify-between">
-								<span class="text-chrome-silver">Name</span>
-								<span class="text-star-white">{bot.shipName ?? "Unknown"}</span>
+						<h3 class="text-sm font-semibold text-chrome-silver uppercase tracking-wider mb-2">Installed Modules</h3>
+						{#if bot.modules && bot.modules.length > 0}
+							<div class="space-y-1 max-h-40 overflow-y-auto">
+								{#each bot.modules as mod}
+									<div class="flex justify-between text-xs py-1 px-2 rounded bg-deep-void/50">
+										<span class="text-star-white">{mod.name || formatId(mod.moduleId)}</span>
+										<span class="mono text-hull-grey">{mod.moduleId}</span>
+									</div>
+								{/each}
 							</div>
-							<div class="flex justify-between">
-								<span class="text-chrome-silver">Class</span>
-								<span class="text-star-white">{bot.shipClass ?? "Unknown"}</span>
-							</div>
-						</div>
+						{:else}
+							<p class="text-xs text-hull-grey">No modules installed</p>
+						{/if}
 					</div>
 
 					<div>
 						<h3 class="text-sm font-semibold text-chrome-silver uppercase tracking-wider mb-2">Cargo Hold</h3>
 						{#if bot.cargo && bot.cargo.length > 0}
-							<div class="space-y-1 max-h-32 overflow-y-auto">
+							<div class="space-y-1 max-h-40 overflow-y-auto">
 								{#each bot.cargo as item}
 									<div class="flex justify-between text-xs py-0.5 border-b border-hull-grey/10 last:border-0">
-										<span class="text-star-white">{item.itemId}</span>
+										<span class="text-star-white">{formatId(item.itemId)}</span>
 										<span class="mono text-chrome-silver">{item.quantity}</span>
 									</div>
 								{/each}
@@ -259,17 +309,20 @@
 					</div>
 
 					<div>
-						<h3 class="text-sm font-semibold text-chrome-silver uppercase tracking-wider mb-2">Modules</h3>
-						{#if bot.modules && bot.modules.length > 0}
-							<div class="space-y-1 max-h-32 overflow-y-auto">
-								{#each bot.modules as mod}
-									<div class="text-xs py-0.5 border-b border-hull-grey/10 last:border-0">
-										<span class="text-star-white">{mod.name}</span>
+						<h3 class="text-sm font-semibold text-chrome-silver uppercase tracking-wider mb-2">Owned Ships</h3>
+						{#if bot.ownedShips && bot.ownedShips.length > 0}
+							<div class="space-y-1 max-h-40 overflow-y-auto">
+								{#each bot.ownedShips as ship}
+									<div class="flex justify-between text-xs py-1 px-2 rounded bg-deep-void/50">
+										<span class="text-star-white {ship.classId === bot.shipClass ? 'font-bold' : ''}">{formatId(ship.classId)}</span>
+										{#if ship.classId === bot.shipClass}
+											<span class="text-plasma-cyan text-[10px] font-medium">ACTIVE</span>
+										{/if}
 									</div>
 								{/each}
 							</div>
 						{:else}
-							<p class="text-xs text-hull-grey">No modules</p>
+							<p class="text-xs text-hull-grey">No ship data</p>
 						{/if}
 					</div>
 				</div>

@@ -111,6 +111,7 @@
 							<th class="pb-2 pr-4">Routine</th>
 							<th class="pb-2 pr-4">State</th>
 							<th class="pb-2 pr-4">Location</th>
+							<th class="pb-2 pr-4">Destination</th>
 							<th class="pb-2 pr-4 text-right">Credits</th>
 							<th class="pb-2 pr-4 text-right">cr/hr</th>
 							<th class="pb-2 pr-4 text-right">Fuel</th>
@@ -156,6 +157,16 @@
 									{bot.systemName ?? "Unknown"}{#if bot.poiName}<span class="text-hull-grey"> - </span><span class="text-star-white">{bot.poiName}</span>{/if}
 									{#if bot.docked}
 										<span class="text-laser-blue ml-1">docked</span>
+									{/if}
+								</td>
+								<td class="py-2 pr-4 text-xs">
+									{#if bot.destination}
+										<span class="text-plasma-cyan">{bot.destination}</span>
+										{#if bot.jumpsRemaining != null}
+											<span class="text-hull-grey ml-1">({bot.jumpsRemaining}J)</span>
+										{/if}
+									{:else}
+										<span class="text-hull-grey">--</span>
 									{/if}
 								</td>
 								<td class="py-2 pr-4 text-right mono text-star-white">

@@ -18,6 +18,7 @@ export type RoutineName =
   | "return_home"
   | "scout"
   | "quartermaster"
+  | "scavenger"
   | "ship_upgrade";
 
 export const ROUTINE_COLORS: Record<RoutineName, string> = {
@@ -32,6 +33,7 @@ export const ROUTINE_COLORS: Record<RoutineName, string> = {
   return_home: "#8899aa",
   scout: "#66ccff",
   quartermaster: "#c9a84c",
+  scavenger: "#c0a060",
   ship_upgrade: "#4ecdc4",
 };
 
@@ -62,11 +64,21 @@ export interface BotSummary {
   shieldPct: number;
   shipClass: string | null;
   shipName: string | null;
+  shipStats: {
+    hull: number; maxHull: number;
+    shield: number; maxShield: number;
+    armor: number; speed: number;
+    cpuUsed: number; cpuCapacity: number;
+    powerUsed: number; powerCapacity: number;
+  } | null;
   docked: boolean;
+  destination: string | null; // Human-readable destination from routine params
+  jumpsRemaining: number | null; // Jumps to reach destination system
   error: string | null;
   uptime: number; // ms since login
   cargo: Array<{ itemId: string; quantity: number }>;
   modules: Array<{ id: string; moduleId: string; name: string }>;
+  ownedShips: Array<{ id: string; classId: string; name: string | null }>;
   skills: Record<string, { level: number; xp: number; xpNext: number }>;
   settings: {
     fuelEmergencyThreshold: number;
